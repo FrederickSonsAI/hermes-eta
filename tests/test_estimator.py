@@ -135,3 +135,40 @@ def test_cap_never_beats_no_cap(pkg):
     free = e.estimate(remaining_items=300, avg_run_s=1800, success_rate=1.0, now=NOW)
     capped = e.estimate(remaining_items=300, avg_run_s=1800, success_rate=1.0, daily_run_cap=100, now=NOW)
     assert capped.likely_at >= free.likely_at
+
+
+def test_running_run_is_credited(pkg):
+    from datetime import timedelta
+    from eta_plugin import estimator as e
+    r = e.estimate(remaining_items=1, avg_run_s=600, success_rate=1.0, running_elapsed_s=[300], now=NOW)
+    assert r.likely_at - NOW == timedelta(seconds=300)
+    three = e.estimate(remaining_items=3, avg_run_s=600, success_rate=1.0, running_elapsed_s=[300],
+                       now=NOW)
+    assert three.likely_at - NOW == timedelta(seconds=1500)
+
+
+def test_elapsed_only_gives_labelled_rough_range(pkg):
+    from datetime import timedelta
+    from eta_plugin import estimator as e
+    r = e.estimate(remaining_items=1, running_elapsed_s=[1200], now=NOW)
+    assert r.status == "ok" and r.confidence == "rough" and r.headline.startswith("Rough guess")
+    # likely: as long again; worst: the slow end (3x elapsed more) plus one retry, since nothing
+    # says how often this work fails: two slow runs of 80 min, less the 20 already run
+    assert r.likely_at - NOW == timedelta(minutes=20) and r.worst_at - NOW == timedelta(minutes=140)
+    assert e.estimate(remaining_items=1, running_elapsed_s=[10], now=NOW).status == "no_data"
+
+
+def test_few_runs_widen_worst_case_and_say_so(pkg):
+    from eta_plugin import estimator as e
+    few = e.estimate(remaining_items=4, stats=e.lane_stats(runs(e, [True, True]), T), now=NOW)
+    lots = e.estimate(remaining_items=4, stats=e.lane_stats(runs(e, [True] * 12), T), now=NOW)
+    assert few.worst_at > lots.worst_at and few.confidence == "low"
+    assert "Based on 2 runs, so the worst case is wide." in few.headline
+    assert lots.headline.endswith("Based on 12 runs.")
+
+
+def test_one_failed_run_is_not_unbounded(pkg):
+    from eta_plugin import estimator as e
+    r = e.estimate(remaining_items=1, stats=e.lane_stats(runs(e, [False]), T), now=NOW)
+    assert r.status == "ok" and 0.15 < r.key_numbers["success_rate_used"] < 0.8
+    assert r.key_numbers["success_rate"] == 0.0

@@ -15,7 +15,11 @@ Never repeat an earlier ETA without recomputing it.
   on a person has no clock: say so, and estimate from the moment they act.
 
 ## 2. Pull live numbers
-- For kanban work, `eta_estimate` with `kanban_assignee` reads open tasks and past runs live.
+- For kanban work, `eta_estimate` with `kanban_assignee` reads open, running and finished tasks
+  live. For a cron job, pass `cron_job` (its id). For delegated subagents, use `lane="subagent"`:
+  their runs are recorded automatically.
+- If something is already running, pass `running_minutes` (how long it has been going) unless
+  the board or cron history already shows it.
 - For other work, `eta_history` shows each lane's runs in the last 3h and 24h, success rate,
   typical and slow run length and the current failure streak. Record runs with `eta_record_run`
   as they finish.
@@ -37,4 +41,6 @@ Never repeat an earlier ETA without recomputing it.
 - If a step waits on a person, say "Clock starts when <they do X>."
 - If it keeps failing, say plainly there is no honest ETA until the failure is fixed, and what
   fixing it takes.
+- Keep the "Based on N runs" or "Rough guess" wording from `answer`: it tells the user how much
+  the estimate rests on. If `status` is `no_data`, say what it needs instead of guessing.
 - Keep it short and say how fresh the data is (`as_of`).

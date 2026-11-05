@@ -1,7 +1,9 @@
 """Run history storage in the plugin's own data directory (one SQLite file).
 
-Holds runs recorded with eta_record_run (cron jobs, CI, delegated agents). Kanban history is
-not stored here; it is read live from the board. Nothing here leaves the machine.
+Holds runs recorded with eta_record_run (CI, scripts, anything else) and, automatically, each
+delegated subagent run Hermes reports through the subagent_stop hook (lane "subagent:<role>",
+start time, duration, success flag; never the child's summary or tool calls). Kanban and cron
+history are not stored here; they are read live. Nothing here leaves the machine.
 """
 
 from __future__ import annotations
@@ -67,6 +69,21 @@ class RunStore:
             rows = self._db().execute(
                 "SELECT started_at, duration_s, ok FROM runs WHERE lane = ? ORDER BY started_at",
                 (_clean_lane(lane),)).fetchall()
+        return [Run(started_at=r[0], duration_s=r[1], ok=bool(r[2])) for r in rows]
+
+    def runs_like(self, prefix: str) -> list[Run]:
+        """Runs of every lane whose name starts with `prefix` (e.g. all "subagent:" lanes)."""
+        with self._lock:
+            rows = self._db().execute(
+                "SELECT started_at, duration_s, ok FROM runs WHERE substr(lane, 1, ?) = ? "
+                "ORDER BY started_at", (len(prefix), prefix)).fetchall()
+        return [Run(started_at=r[0], duration_s=r[1], ok=bool(r[2])) for r in rows]
+
+    def all_runs(self, exclude_lane: Optional[str] = None) -> list[Run]:
+        with self._lock:
+            rows = self._db().execute(
+                "SELECT started_at, duration_s, ok FROM runs WHERE lane != ? ORDER BY started_at",
+                (_clean_lane(exclude_lane) if exclude_lane else "",)).fetchall()
         return [Run(started_at=r[0], duration_s=r[1], ok=bool(r[2])) for r in rows]
 
     def lanes(self) -> list[str]:

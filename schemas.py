@@ -8,9 +8,11 @@ ETA_ESTIMATE = {
         "'how long', or for an ETA on a task, queue, job, agent or kanban board. Pass the lane "
         "(the agent or queue doing the work) to use its recorded runs, or kanban_assignee to read a "
         "kanban assignee's open tasks and past runs live, and override "
-        "any number you know better. Returns 'unbounded' instead of a time when the work keeps "
-        "failing, and 'blocked_on_person' when a step waits on a human. Always recompute: never "
-        "repeat an earlier ETA."
+        "any number you know better. Time already spent on running work is taken off. With fewer "
+        "than 5 runs the answer says so and widens the worst case; with none it gives a labelled "
+        "rough guess or says what it needs. Returns 'unbounded' instead of a time when the work "
+        "keeps failing, and 'blocked_on_person' when a step waits on a human. Relay the answer "
+        "text as is. Always recompute: never repeat an earlier ETA."
     ),
     "parameters": {
         "type": "object",
@@ -23,11 +25,21 @@ ETA_ESTIMATE = {
                                                "tasks to read live through the kanban tools."},
             "board": {"type": "string", "description": "Kanban board slug (default: current board)."},
             "lane": {"type": "string",
-                     "description": "Agent, kanban assignee or queue name whose history to use."},
+                     "description": "Agent or queue name whose recorded history to use. Delegated "
+                                    "subagent runs are recorded automatically as 'subagent:leaf' / "
+                                    "'subagent:orchestrator'; 'subagent' pools them."},
+            "cron_job": {"type": "string",
+                         "description": "Cron job id: read its past runs and any run in progress "
+                                        "from Hermes's cron run history."},
+            "running_minutes": {"type": "number", "minimum": 0,
+                                "description": "Minutes the current run has already been going "
+                                               "(it counts as one of the remaining items)."},
             "queue_ahead": {"type": "integer", "minimum": 0,
                             "description": "Runs queued ahead of this work in the same lane."},
             "lanes": {"type": "integer", "minimum": 1,
-                      "description": "How many runs can go at once (parallel workers)."},
+                      "description": "How many runs can go at once (parallel workers). With "
+                                     "kanban_assignee the default is how many tasks are running "
+                                     "or ready now, within Hermes's dispatch caps; otherwise 1."},
             "avg_run_minutes": {"type": "number", "exclusiveMinimum": 0,
                                 "description": "Override the typical run length in minutes."},
             "success_rate": {"type": "number", "minimum": 0, "maximum": 1,
@@ -53,8 +65,9 @@ ETA_RECORD_RUN = {
     "name": "eta_record_run",
     "description": (
         "Record one finished run (how long it took and whether it succeeded) for a lane, so "
-        "later ETAs use real numbers. Kanban tasks are recorded automatically; use this for "
-        "other work such as cron jobs, CI runs or delegated agents."
+        "later ETAs use real numbers. Kanban and cron history are read live and delegated "
+        "subagent runs are recorded automatically; use this for other work such as CI runs or "
+        "scripts."
     ),
     "parameters": {
         "type": "object",

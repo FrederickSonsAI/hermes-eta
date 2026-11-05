@@ -11,9 +11,11 @@ provides_tools:
   - eta_estimate
   - eta_record_run
   - eta_history
+provides_hooks:
+  - subagent_stop
 config_schema:
   timezone:
     type: str
     default: ""
     label: "Time zone"
-    description: "IANA time zone for answers, e.g. America/New_York. Empty means UTC."
+    description: "IANA time zone for answers, e.g. America/New_York. Empty means Hermes's own time zone."
