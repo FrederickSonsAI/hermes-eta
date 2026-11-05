@@ -18,7 +18,8 @@ def test_basic_range(pkg):
     assert stats.success_rate == 0.9 and stats.fail_streak == 0
     r = e.estimate(remaining_items=9, stats=stats, lanes=1, now=NOW, tz=ZoneInfo("America/New_York"))
     assert r.status == "ok"
-    assert r.runs_needed == 10
+    assert r.runs_needed == 9  # typical case: most runs succeed, so one run per item
+    assert (r.likely_at - NOW).total_seconds() == 9 * 600
     assert r.likely_at < r.worst_at
     assert r.headline.startswith("Likely between") and "today" in r.headline
     assert r.likely_at.tzinfo is not None
@@ -172,3 +173,67 @@ def test_one_failed_run_is_not_unbounded(pkg):
     r = e.estimate(remaining_items=1, stats=e.lane_stats(runs(e, [False]), T), now=NOW)
     assert r.status == "ok" and 0.15 < r.key_numbers["success_rate_used"] < 0.8
     assert r.key_numbers["success_rate"] == 0.0
+
+
+# The likely case is the typical one: retries for failures belong in the worst case only.
+
+def test_one_item_with_prior_is_one_run(pkg):
+    from eta_plugin import estimator as e
+    stats = e.lane_stats(runs(e, [True, True], minutes=4), T)  # 2 runs: prior pulls rate to 0.9
+    r = e.estimate(remaining_items=1, stats=stats, now=NOW)
+    assert r.key_numbers["success_rate_used"] < 1
+    assert r.runs_needed == 1
+    assert (r.likely_at - NOW).total_seconds() == 4 * 60
+    assert r.worst_at > r.likely_at
+
+
+def test_one_item_with_80pct_prior_rate(pkg):
+    from eta_plugin import estimator as e
+    stats = e.lane_stats(runs(e, [False, True, True], minutes=3), T)
+    # 2 of 3 ok, shrunk with 2 prior runs at 0.8: (2 + 1.6) / 5 = 0.72
+    r = e.estimate(remaining_items=1, stats=stats, now=NOW)
+    assert round(r.key_numbers["success_rate_used"], 2) == 0.72
+    assert r.runs_needed == 1 and (r.likely_at - NOW).total_seconds() == 180
+    r = e.estimate(remaining_items=1, stats=stats, success_rate=0.8, avg_run_s=300, now=NOW)
+    assert r.runs_needed == 1 and (r.likely_at - NOW).total_seconds() == 300
+    assert r.worst_at > r.likely_at
+
+
+def test_one_item_with_half_observed_success(pkg):
+    from eta_plugin import estimator as e
+    stats = e.lane_stats(runs(e, [True, False] * 5, minutes=5), T)
+    assert stats.success_rate == 0.5 and stats.samples == 10 and stats.fail_streak == 1
+    r = e.estimate(remaining_items=1, stats=stats, now=NOW)
+    assert r.status == "ok" and r.runs_needed == 1
+    assert (r.likely_at - NOW).total_seconds() == 300      # the typical item: one run
+    assert (r.worst_at - NOW).total_seconds() >= 3 * 300   # retries: rate 0.35 -> 3 runs
+
+
+def test_low_rate_uses_expected_runs_unrounded(pkg):
+    from eta_plugin import estimator as e
+    r = e.estimate(remaining_items=1, avg_run_s=600, success_rate=0.4, now=NOW)
+    assert (r.likely_at - NOW).total_seconds() == 2.5 * 600   # 1 / 0.4, not ceil -> 3
+    assert r.key_numbers["runs_expected"] == 2.5 and r.runs_needed == 3
+    assert r.worst_at > r.likely_at
+    r = e.estimate(remaining_items=1, avg_run_s=600, success_rate=0.4, lanes=4, now=NOW)
+    assert (r.likely_at - NOW).total_seconds() == 600   # a spare lane takes the fraction
+
+
+def test_rounds_helper(pkg):
+    from eta_plugin import estimator as e
+    assert e._rounds(0, 2) == 0 and e._rounds(3, 1) == 3 and e._rounds(3, 2) == 2
+    assert e._rounds(2.5, 1) == 2.5 and e._rounds(6.5, 4) == 2 and e._rounds(4.5, 4) == 1.5
+    assert e.likely_runs(3, 0.8) == 3 and e.likely_runs(3, 0.25) == 12 and e.likely_runs(0, 0.2) == 0
+
+
+def test_no_honest_eta_still_fires_when_work_keeps_failing(pkg):
+    from eta_plugin import estimator as e
+    stats = e.lane_stats(runs(e, [True, False, False, False]), T)
+    r = e.estimate(remaining_items=1, stats=stats, now=NOW)
+    assert r.status == "unbounded" and "No honest ETA" in r.headline and r.likely_at is None
+    stats = e.lane_stats(runs(e, [False] * 9 + [True, False]), T)  # 1 of 11 ok, no 3-run streak
+    assert stats.fail_streak < e.STUCK_STREAK and stats.success_rate < e.MIN_SUCCESS_RATE
+    r = e.estimate(remaining_items=1, stats=stats, now=NOW)
+    assert r.status == "unbounded" and "No honest ETA" in r.headline
+    r = e.estimate(remaining_items=1, avg_run_s=60, success_rate=0.1, now=NOW)
+    assert r.status == "unbounded" and "No honest ETA" in r.headline

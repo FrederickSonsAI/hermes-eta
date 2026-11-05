@@ -30,7 +30,8 @@ Never repeat an earlier ETA without recomputing it.
 - Call `eta_estimate` with `remaining_items` and the `lane` (or `kanban_assignee`), and any number you know better
   (`queue_ahead`, `lanes`, `daily_run_cap`, `runs_left_today`, `reset_hour`, `review_minutes`,
   `waiting_on`, `timezone`).
-- Runs needed = remaining items / success rate. Time = (runs ahead + runs needed) x typical run
+- Runs needed = remaining items when most runs succeed, else remaining items / success rate
+  (retries for failures are in the worst case). Time = (runs ahead + runs needed) x typical run
   length / parallel lanes, pushed past the daily reset when the cap runs out.
 - If the lane keeps failing the same way (`status: unbounded`), there is no honest ETA.
 

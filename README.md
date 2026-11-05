@@ -90,9 +90,16 @@ how long one run takes once it starts, not when the schedule fires it.
 
 ## How the estimate works
 
-- Runs needed = remaining items / success rate (last 24 hours, falling back to all history).
+- "Likely" is the typical case. When at least half the runs succeed (last 24 hours, falling back
+  to all history), the typical item takes one run, so runs needed = remaining items. Below half,
+  it is the expected number, remaining items / success rate, not rounded up.
 - Time = (runs queued ahead + runs needed) x typical run length / parallel lanes.
-- Worst case uses slow (90th percentile) runs and a success rate 15 points lower.
+- Retries for failures go in the worst case: slow (90th percentile) runs and remaining items /
+  a success rate 15 points lower, rounded up to whole runs.
+- Changed after a walk-forward backtest on one fleet's real jobs: the first version always
+  rounded remaining / success rate up, so with under 5 runs (rate pulled below 100%) one job
+  counted as two runs and "likely" doubled. The fix is a logic change, no constant was tuned, and
+  it was checked on the same data that showed the flaw.
 - Runs already going are credited with the time they have run; one past the slow mark gets no
   credit in the worst case (it may have to start over) and is named as the biggest risk.
 - A daily run cap pushes the remainder past the next reset hour; all math is in UTC, so

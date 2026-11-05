@@ -1,7 +1,9 @@
 """Pure ETA math. No Hermes imports, no I/O, so it is easy to test and reason about.
 
 The model: work is a number of runs that each take some time and succeed with some
-probability. Runs needed = remaining items / success rate. Wall time = (runs ahead in the
+probability. The likely case is the typical one: when most runs succeed (rate 0.5 or more) the
+typical item takes one run, otherwise remaining items / success rate runs on average (not rounded
+up). Retries for failures go in the worst case, which rounds up at a lower success rate. Wall time = (runs ahead in the
 queue + runs needed) * average run time / parallel lanes, stretched past a daily reset when
 a daily run cap cannot cover the work. Runs already going are credited with the time they have
 run. With few runs the worst case widens; with none, a rough answer is labelled as rough. The
@@ -114,13 +116,39 @@ def _next_reset(after_utc: datetime, reset_hour: int, tz: tzinfo) -> datetime:
     return candidate.astimezone(timezone.utc)
 
 
-def _finish_time(start_utc: datetime, runs: int, run_s: float, lanes: int,
+def _rounds(n: float, lanes: int) -> float:
+    """Run lengths `n` runs take `lanes` at a time. Whole runs fill rounds; an expected fraction
+    of a run (the likely case at a low success rate) adds that fraction of a round only when no
+    lane is free in the last round."""
+    if n <= 0:
+        return 0.0
+    whole = math.floor(n + 1e-9)
+    frac = n - whole if n - whole > 1e-9 else 0.0
+    rounds = float(math.ceil(whole / lanes)) if whole else 0.0
+    if frac and whole % lanes == 0:
+        rounds += frac
+    return rounds
+
+
+def likely_runs(remaining_items: int, success_rate: Optional[float]) -> float:
+    """Runs the typical case takes. At a success rate of 0.5 or more the typical (median) item
+    succeeds on its first run, so one run per item. Below that, the expected number of runs,
+    remaining / rate, not rounded up: rounding up is a retry, and retries belong in the worst
+    case."""
+    if remaining_items <= 0:
+        return 0.0
+    if success_rate is None or success_rate >= 0.5:
+        return float(remaining_items)
+    return remaining_items / success_rate
+
+
+def _finish_time(start_utc: datetime, runs: float, run_s: float, lanes: int,
                  runs_left_today: Optional[int], daily_cap: Optional[int],
                  reset_hour: int, tz: tzinfo) -> datetime:
     """Runs go `lanes` at a time. A daily cap pushes the rest past each reset.
     All arithmetic is in UTC so DST changes never shift the answer."""
-    def span(n: int) -> timedelta:
-        return timedelta(seconds=math.ceil(n / lanes) * run_s)
+    def span(n: float) -> timedelta:
+        return timedelta(seconds=_rounds(n, lanes) * run_s)
 
     t = start_utc
     remaining = runs
@@ -257,12 +285,15 @@ def estimate(*, remaining_items: int, stats: Optional[LaneStats] = None,
 
     wide = rough is not None or (avg_run_s is None and samples < LOW_SAMPLES)
     sr_eff = sr if sr is not None else 1.0
-    runs_needed = math.ceil(remaining_items / sr_eff) if remaining_items > 0 else 0
+    runs_likely = likely_runs(remaining_items, sr_eff)
+    runs_needed = math.ceil(runs_likely - 1e-9)  # whole runs to plan for in the typical case
     # Worst case: success a notch worse, slow (p90) runs. With little data, both notches widen.
     drop = 0.3 if wide else 0.15
     sr_worst = max(sr_eff - drop, MIN_SUCCESS_RATE) if sr is not None else (0.7 if wide else 0.85)
     runs_worst = math.ceil(remaining_items / sr_worst) if remaining_items > 0 else 0
     numbers["runs_needed"] = runs_needed
+    if runs_likely != runs_needed:
+        numbers["runs_expected"] = round(runs_likely, 2)
 
     clock = waiting_on_person or None
     slow = max(p90 or med * 1.5, med)
@@ -270,7 +301,7 @@ def estimate(*, remaining_items: int, stats: Optional[LaneStats] = None,
         slow = max(slow, longest or 0.0, med * 2)
     numbers["slow_run_minutes"] = round(slow / 60, 1)
     try:
-        likely, worst = _range(now_utc, now, tz, queue_ahead, runs_needed, runs_worst, med, slow,
+        likely, worst = _range(now_utc, now, tz, queue_ahead, runs_likely, runs_worst, med, slow,
                                lanes, runs_left_today, daily_run_cap, reset_hour, review_s, running)
     except OverflowError:
         return Estimate(status="unbounded",
