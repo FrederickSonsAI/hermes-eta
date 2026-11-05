@@ -33,7 +33,7 @@ Biggest risk: 9 runs are queued ahead of this work.
 | Tool | `eta_estimate` | Time range (likely and worst case), key numbers, biggest risk, or `unbounded` / `blocked_on_person`. With `kanban_assignee` it reads that assignee's open, running and finished tasks live from the board; with `cron_job` it reads that job's run history; `running_minutes` says how long the current run has been going |
 | Tool | `eta_record_run` | Record one finished run for a lane (CI, scripts, anything Hermes does not report itself) |
 | Tool | `eta_history` | Per-lane runs in 3h and 24h, success rate, typical and slow run length, failure streak |
-| Hook | `subagent_stop` | Records each delegated subagent run (role, outcome, duration) as lane `subagent:<role>`; `lane="subagent"` pools them |
+| Hook | `subagent_stop` | Records each delegated subagent run (role, outcome, duration) as lane `subagent:<role>`; `lane="subagent"` pools them (an orchestrator's run includes its children's time, so ask for `subagent:leaf` to estimate leaf work) |
 | Command | `/eta <lane> <remaining> [ahead]`, `/eta @<assignee> [board]`, `/eta cron <job id> [remaining]` | Quick estimate in chat; `/eta` alone lists lanes |
 | Skill | `eta:eta` | The workflow for answering ETA questions well |
 
@@ -59,10 +59,14 @@ data) never fails the estimate: the answer falls back to Hermes's zone, then UTC
 through `ctx.dispatch_tool`, so it works across profiles: one `kanban_list` call for the whole
 board (up to 200 tasks), plus `kanban_show` for at most 6 tasks (running ones first, then the
 most recently finished), because only `kanban_show` returns each attempt's outcome. Open tasks
-(triage, todo, scheduled, ready, running, review) are the remaining work. Attempts that ended
-`completed` or `review_requested` count as successes; `crashed`, `timed_out`, `spawn_failed`,
-`gave_up`, `reclaimed`, `stale` and `changes_requested` count as failed attempts. Blocked tasks
-usually wait on a person, so they are reported, not counted as failures.
+(triage, todo, scheduled, ready, running, review) are the remaining work. Only the assignee's own
+attempts count (a task's run list also holds a reviewer's runs). Attempts that ended `completed`
+or `review_requested` count as successes, except a hand-off to review that the review then sent
+back (`changes_requested`), which counts as a failed attempt; for the reviewer, that review run
+itself is a finished run. `crashed`, `timed_out`, `spawn_failed`, `gave_up`, `stale` and
+`reclaimed` (worker died, claim expired) count as failed attempts; a reclaim an operator caused
+(manual reclaim, ancestor reopened, task archived) counts as neither, as in Hermes's own failure
+count. Blocked tasks usually wait on a person, so they are reported, not counted as failures.
 
 Parallel lanes default to how many of the assignee's tasks are running or ready now, within
 Hermes's dispatch caps (`kanban.max_in_progress` or its memory-derived default, and
@@ -71,7 +75,10 @@ attempt has already run.
 
 Side effect to know about: Hermes's `kanban_list` (like `hermes kanban list`) first promotes
 tasks whose dependencies have cleared to `ready`. The plugin itself writes nothing to the board.
-This needs the kanban toolset in the session (an orchestrator profile).
+No read-only kanban tool lists a board, so this cannot be avoided without bypassing Hermes's
+kanban tools. The board is read only where Hermes itself offers `kanban_list` (a profile with
+the kanban toolset, not a delegated child or a dispatcher-spawned worker); elsewhere the
+estimate says the kanban tools are not available and calls nothing.
 
 ## Cron, live
 
@@ -94,7 +101,11 @@ how long one run takes once it starts, not when the schedule fires it.
   returns `unbounded`: no honest ETA.
 - Under 5 runs: the answer says "Based on N runs, so the worst case is wide", the success rate
   is pulled toward 80% (so one lucky or unlucky run cannot decide it), and the worst case uses
-  at least twice the typical run and a success rate 30 points lower. One failure in one run is
+  at least twice the typical run and a success rate 30 points lower. These are deliberate
+  choices, not measured constants: the 80% counts as two runs, so one failure gives 53%, one
+  success 87%, and from 5 runs on only the observed rate is used; the slowest of a handful of
+  runs is a poor guide to the slow tail, so the worst case never assumes less than twice the
+  typical run. One failure in one run is
   not "no honest ETA"; three failures in a row still is.
 - No finished runs: if a run is in progress, a labelled rough guess from its elapsed time
   (as long again likely, three times as long again at the slow end, plus a retry when nothing
@@ -112,8 +123,11 @@ how long one run takes once it starts, not when the schedule fires it.
   delegated subagent run Hermes reports through the `subagent_stop` hook (lane
   `subagent:<role>`). From the hook it keeps only the role, status and duration; it never
   stores the child's summary, tool calls or session ids. Old rows are trimmed to 2,000 per lane.
-- Hook: `subagent_stop`, an observer. It runs one small insert on the parent thread after a
-  delegation finishes, never blocks or changes the delegation, and swallows its own errors.
+- Hook: `subagent_stop`, an observer. Hermes fires it once per delegated child (batch and
+  nested delegations included: each child is reported by its own parent) on the parent's
+  thread. It runs one small insert, waits at most a quarter of a second for the file (if
+  another thread or process holds it, that run is not recorded), never changes the delegation,
+  and swallows its own errors. Interrupted children are not recorded.
 - Reads, only when asked for an estimate:
   - the kanban board, through Hermes's `kanban_list` and `kanban_show` tools (task statuses,
     run times and outcomes). `kanban_list` promotes dependency-cleared tasks to `ready` as part
@@ -122,7 +136,9 @@ how long one run takes once it starts, not when the schedule fires it.
     timestamps), only when the cron run ledger already exists. Opening it is Hermes's own code,
     which may upgrade an old ledger's schema.
   - Hermes's time zone (`hermes_time.get_timezone`) and kanban concurrency settings
-    (`kanban.max_in_progress`, `kanban.max_in_progress_per_profile`).
+    (`kanban.max_in_progress`, `kanban.max_in_progress_per_profile`; when the first is unset,
+    Hermes's own default is derived from the machine's total memory).
+  - whether Hermes offers the kanban tools here (Hermes's tool registry availability check).
 - Blocks nothing and never asks for approval.
 
 ## Per surface

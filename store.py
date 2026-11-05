@@ -17,6 +17,7 @@ from .estimator import Run
 
 PLUGIN_NAME = "eta"
 MAX_ROWS_PER_LANE = 2000  # keep the file small; old runs carry little signal
+_BUSY_TIMEOUT_MS = 5000  # Hermes's open_db default, restored after a bounded hook write
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -51,18 +52,37 @@ class RunStore:
         return self._conn
 
     def record(self, lane: str, duration_s: float, ok: bool,
-               started_at: Optional[float] = None, source: str = "manual") -> None:
+               started_at: Optional[float] = None, source: str = "manual",
+               wait_s: Optional[float] = None) -> bool:
+        """Insert one run. With `wait_s`, give up (return False, nothing written) rather than
+        wait longer than that for this store's lock or for another process holding the file."""
         lane = _clean_lane(lane)
         started = started_at if started_at is not None else time.time() - max(duration_s, 0)
-        with self._lock:
+        if not self._lock.acquire(timeout=wait_s if wait_s is not None else -1):
+            return False
+        try:
             db = self._db()
-            db.execute("INSERT INTO runs(lane, started_at, duration_s, ok, source) VALUES (?,?,?,?,?)",
-                       (lane, float(started), float(max(duration_s, 0)), 1 if ok else 0, source))
-            db.execute(
-                "DELETE FROM runs WHERE lane = ? AND id NOT IN "
-                "(SELECT id FROM runs WHERE lane = ? ORDER BY started_at DESC LIMIT ?)",
-                (lane, lane, MAX_ROWS_PER_LANE))
-            db.commit()
+            if wait_s is not None:
+                db.execute(f"PRAGMA busy_timeout={max(int(wait_s * 1000), 1)}")
+            try:
+                db.execute("INSERT INTO runs(lane, started_at, duration_s, ok, source) VALUES (?,?,?,?,?)",
+                           (lane, float(started), float(max(duration_s, 0)), 1 if ok else 0, source))
+                db.execute(
+                    "DELETE FROM runs WHERE lane = ? AND id NOT IN "
+                    "(SELECT id FROM runs WHERE lane = ? ORDER BY started_at DESC LIMIT ?)",
+                    (lane, lane, MAX_ROWS_PER_LANE))
+                db.commit()
+            except sqlite3.OperationalError:
+                db.rollback()
+                if wait_s is None:
+                    raise
+                return False
+            finally:
+                if wait_s is not None:
+                    db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            return True
+        finally:
+            self._lock.release()
 
     def runs(self, lane: str) -> list[Run]:
         with self._lock:

@@ -48,7 +48,8 @@ class FakeKanban:
                    {"started_at": now - 7200, "ended_at": now - 6600, "outcome": "completed"},
                    {"started_at": now - 6000, "ended_at": None, "outcome": None}],
             # o3: an earlier attempt was reclaimed; the active attempt started 4 min ago
-            "o3": [{"started_at": now - 3 * 3600, "ended_at": now - 3 * 3600 + 300, "outcome": "reclaimed"},
+            "o3": [{"started_at": now - 3 * 3600, "ended_at": now - 3 * 3600 + 300, "outcome": "reclaimed",
+                    "error": "claim expired"},
                    {"started_at": now - 240, "ended_at": None, "outcome": None}],
         }
 
@@ -168,18 +169,83 @@ def test_kanban_call_budget_with_a_big_board(store):
     assert names.count("kanban_list") == 1 and names.count("kanban_show") <= 6
 
 
-def test_reclaimed_and_changes_requested_are_failed_attempts(store):
+def test_reclaimed_stale_and_rejected_handoffs_are_failed_attempts(store):
     fk = FakeKanban(NOW)
     fk.runs["d1"] = [
-        {"started_at": NOW - 5000, "ended_at": NOW - 4900, "outcome": "reclaimed"},
-        {"started_at": NOW - 4800, "ended_at": NOW - 4200, "outcome": "review_requested"},
-        {"started_at": NOW - 4100, "ended_at": NOW - 4000, "outcome": "changes_requested"},
-        {"started_at": NOW - 3900, "ended_at": NOW - 3300, "outcome": "completed"}]
+        {"started_at": NOW - 5000, "ended_at": NOW - 4900, "outcome": "reclaimed",
+         "error": "worker pid gone", "profile": "writer"},
+        {"started_at": NOW - 4800, "ended_at": NOW - 4200, "outcome": "review_requested",
+         "profile": "writer"},
+        # the reviewer's own run: another profile, not this assignee's history
+        {"started_at": NOW - 4100, "ended_at": NOW - 4000, "outcome": "changes_requested",
+         "profile": "reviewer"},
+        {"started_at": NOW - 3900, "ended_at": NOW - 3300, "outcome": "completed", "profile": "Writer"}]
     fk.runs["d2"] = [{"started_at": NOW - 3000, "ended_at": NOW - 2400, "outcome": "stale"},
                      {"started_at": NOW - 2300, "ended_at": NOW - 1700, "outcome": "completed"}]
     out = json.loads(_handlers(store, fk).eta_estimate({"kanban_assignee": "writer"}))
-    # failed: reclaimed, changes_requested, stale, o3's reclaim = 4 of 7
-    assert out["key_numbers"]["success_rate"] == round(3 / 7, 3)
+    # failed: reclaim with an error, the hand-off review sent back, stale, o3's reclaim = 4 of 6
+    assert out["key_numbers"]["success_rate"] == round(2 / 6, 3)
+    assert out["based_on_runs"] == 6
+
+
+def test_operator_reclaims_are_not_failures(store):
+    fk = FakeKanban(NOW)
+    fk.runs["d1"] = [
+        {"started_at": NOW - 5000, "ended_at": NOW - 4900, "outcome": "reclaimed"},  # archived
+        {"started_at": NOW - 4800, "ended_at": NOW - 4700, "outcome": "reclaimed",
+         "error": "manual_reclaim: wrong branch"},
+        {"started_at": NOW - 4600, "ended_at": NOW - 4000, "outcome": "completed"}]
+    fk.runs["d2"] = [{"started_at": NOW - 3000, "ended_at": NOW - 2400, "outcome": "completed"}]
+    fk.runs["o3"] = [{"started_at": NOW - 240, "ended_at": None, "outcome": None}]
+    out = json.loads(_handlers(store, fk).eta_estimate({"kanban_assignee": "writer"}))
+    assert out["status"] == "ok" and out["key_numbers"]["success_rate"] == 1.0
+    assert out["based_on_runs"] == 2
+
+
+def test_reviewer_lane_counts_changes_requested_as_a_finished_review(store):
+    fk = FakeKanban(NOW)
+    fk.tasks = [{"id": "v1", "status": "done"}, {"id": "v2", "status": "review"}]
+    fk.runs = {"v1": [
+        {"started_at": NOW - 9000, "ended_at": NOW - 8000, "outcome": "review_requested",
+         "profile": "builder"},
+        {"started_at": NOW - 7900, "ended_at": NOW - 7600, "outcome": "changes_requested",
+         "profile": "writer"},
+        {"started_at": NOW - 7000, "ended_at": NOW - 6000, "outcome": "review_requested",
+         "profile": "builder"},
+        {"started_at": NOW - 5900, "ended_at": NOW - 5600, "outcome": "completed", "profile": "writer"}]}
+    out = json.loads(_handlers(store, fk).eta_estimate({"kanban_assignee": "writer"}))
+    assert out["key_numbers"]["success_rate"] == 1.0 and out["based_on_runs"] == 2
+    assert out["key_numbers"]["remaining_items"] == 1
+
+
+def test_kanban_not_read_where_hermes_hides_it(store):
+    fk = FakeKanban(NOW)
+    h = _handlers(store, fk, tool_visible=lambda name: False)
+    assert "not available" in json.loads(h.eta_estimate({"kanban_assignee": "writer"}))["error"]
+    assert fk.calls == []  # nothing dispatched: no board read, no ready promotion
+
+    def broken(name):
+        raise RuntimeError("registry unavailable")
+    h = _handlers(store, fk, tool_visible=broken)
+    assert "not available" in json.loads(h.eta_estimate({"kanban_assignee": "writer"}))["error"]
+    assert fk.calls == []
+
+
+def test_register_gates_kanban_on_hermes_tool_availability(pkg, fake_ctx, monkeypatch):
+    import sys
+    import types
+    fk = FakeKanban(NOW)
+    fake_ctx.dispatch_tool = fk
+    shown = set()
+    registry = types.SimpleNamespace(
+        get_definitions=lambda names, quiet=False: [{"name": n} for n in names if n in shown])
+    monkeypatch.setitem(sys.modules, "tools", types.ModuleType("tools"))
+    monkeypatch.setitem(sys.modules, "tools.registry", types.SimpleNamespace(registry=registry))
+    ctx = _register(pkg, fake_ctx, monkeypatch)
+    hidden = json.loads(ctx.tools["eta_estimate"]({"kanban_assignee": "writer"}))
+    assert "not available" in hidden["error"] and fk.calls == []
+    shown.add("kanban_list")
+    assert json.loads(ctx.tools["eta_estimate"]({"kanban_assignee": "writer"}))["status"] == "ok"
 
 
 def test_lanes_follow_running_and_ready_within_dispatch_cap(store):
@@ -233,6 +299,40 @@ def test_subagent_stop_records_runs(pkg, fake_ctx, monkeypatch):
     assert hist["subagent:orchestrator"]["runs_total"] == 1
     pooled = json.loads(ctx.tools["eta_estimate"]({"lane": "subagent", "remaining_items": 1}))
     assert pooled["based_on_runs"] == 3 and pooled["history_used"]
+
+
+def test_subagent_stop_gives_up_fast_when_the_store_is_busy(store, pkg):
+    import time as _time
+    from eta_plugin.tools import HOOK_WAIT_S
+    h = _handlers(store)
+    store._lock.acquire()  # another thread is mid-write
+    try:
+        t0 = _time.monotonic()
+        assert h.on_subagent_stop(child_role="leaf", child_status="completed", duration_ms=5000) is None
+        assert _time.monotonic() - t0 < HOOK_WAIT_S + 0.5
+    finally:
+        store._lock.release()
+    assert store.runs("subagent:leaf") == []  # dropped, never blocked
+    h.on_subagent_stop(child_role="leaf", child_status="completed", duration_ms=5000)
+    assert len(store.runs("subagent:leaf")) == 1
+
+
+def test_subagent_stop_gives_up_when_another_process_locks_the_file(tmp_path, pkg):
+    from eta_plugin.store import RunStore
+    path = tmp_path / "data.db"
+    store = RunStore(connect=lambda: sqlite3.connect(path, timeout=5, check_same_thread=False))
+    store.runs("x")  # create the schema
+    other = sqlite3.connect(path, timeout=0)
+    other.execute("BEGIN EXCLUSIVE")
+    try:
+        import time as _time
+        t0 = _time.monotonic()
+        assert store.record("subagent:leaf", 5, True, wait_s=0.1) is False
+        assert _time.monotonic() - t0 < 2
+    finally:
+        other.rollback()
+        other.close()
+    assert store.record("subagent:leaf", 5, True, wait_s=0.1) is True
 
 
 def test_subagent_stop_never_raises(pkg, fake_ctx, monkeypatch):

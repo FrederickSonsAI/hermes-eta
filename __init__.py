@@ -46,6 +46,13 @@ def _hermes_dispatch_cap():
     return min(caps) if caps else None
 
 
+def _hermes_tool_visible(name: str) -> bool:
+    """True when Hermes's own availability check offers tool `name` here (the same per-tool
+    check that decides which tools the model sees). ctx.dispatch_tool does not apply it."""
+    from tools.registry import registry
+    return bool(registry.get_definitions({name}, quiet=True))
+
+
 def _hermes_cron_runs(job_id: str):
     """Newest-first run history of one cron job (read-only query). None when this Hermes has
     no cron run ledger yet: the ledger is never created just to read it."""
@@ -74,7 +81,8 @@ def register(ctx):
             return None
 
     h = Handlers(store, default_tz=default_tz, dispatch=ctx.dispatch_tool, host_tz=_hermes_tz,
-                 dispatch_cap=_hermes_dispatch_cap, cron_reader=cron_reader)
+                 dispatch_cap=_hermes_dispatch_cap, cron_reader=cron_reader,
+                 tool_visible=_hermes_tool_visible)
 
     ctx.register_tool(name="eta_estimate", toolset=TOOLSET, schema=schemas.ETA_ESTIMATE,
                       handler=h.eta_estimate)

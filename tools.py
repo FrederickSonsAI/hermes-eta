@@ -15,13 +15,22 @@ from .store import RunStore
 
 # Kanban statuses that still need work, and run outcomes that count as failed attempts.
 # "blocked" is neither: it usually means the task waits on a person. A reclaimed or stale run
-# (worker died, claim expired, task dragged off running) and a review that sent the work back
-# (changes_requested) are attempts that did not land.
+# (worker died, claim expired) is an attempt that did not land, as Hermes's own failure breaker
+# counts it; an operator's reclaim (manual reclaim, ancestor reopened, task archived) is not.
 _OPEN = {"triage", "todo", "scheduled", "ready", "running", "review"}
-_FAILED = {"crashed", "timed_out", "spawn_failed", "gave_up", "reclaimed", "stale",
-           "changes_requested"}
-# A run that hands work to review finished its attempt successfully.
-_SUCCEEDED = {"completed", "review_requested"}
+_FAILED = {"crashed", "timed_out", "spawn_failed", "gave_up", "reclaimed", "stale"}
+# A run that hands work to review finished its attempt, unless the review that follows sends it
+# back. changes_requested ends the reviewer's own run: the review was done, so it is a success
+# for the reviewer, and it marks the hand-off it rejected as a failed attempt.
+_SUCCEEDED = {"completed", "review_requested", "changes_requested"}
+_REVIEW_VERDICTS = {"completed", "changes_requested"}
+
+
+def _operator_reclaim(run: dict) -> bool:
+    """A reclaim an operator caused carries no error (ancestor reopened, archived mid-run) or a
+    manual_reclaim one; Hermes resets the task's failure count for those."""
+    error = run.get("error")
+    return not error or str(error).startswith("manual_reclaim")
 # One kanban_list call reads the whole board for the assignee; kanban_show (the only tool that
 # returns per-run outcomes) is called for at most this many tasks: running ones first, then the
 # most recently finished.
@@ -33,6 +42,8 @@ _QUIET_S = 3600
 # Delegated subagent runs are recorded under "subagent:<role>"; lane "subagent" pools them.
 SUBAGENT_LANE = "subagent"
 _SUBAGENT_STATUSES = {"completed": True, "failed": False, "error": False, "timeout": False}
+# The hook never holds the parent's delegation up longer than this waiting for the SQLite file.
+HOOK_WAIT_S = 0.25
 
 
 class BadInput(ValueError):
@@ -108,7 +119,8 @@ class Handlers:
                  dispatch: Optional[Callable[..., str]] = None,
                  host_tz: Callable[[], Optional[tzinfo]] = lambda: None,
                  dispatch_cap: Callable[[], Optional[int]] = lambda: None,
-                 cron_reader: Optional[Callable[[str], Optional[list]]] = None):
+                 cron_reader: Optional[Callable[[str], Optional[list]]] = None,
+                 tool_visible: Callable[[str], bool] = lambda name: True):
         self.store = store
         self.default_tz = default_tz
         self.clock = clock
@@ -116,6 +128,16 @@ class Handlers:
         self.host_tz = host_tz
         self.dispatch_cap = dispatch_cap
         self.cron_reader = cron_reader
+        self.tool_visible = tool_visible
+
+    def _visible(self, name: str) -> bool:
+        """Whether Hermes would offer tool `name` here (its own availability check). The kanban
+        tools are hidden from delegated children and from profiles without the kanban toolset;
+        the estimate does not reach them where Hermes hides them."""
+        try:
+            return bool(self.tool_visible(name))
+        except Exception:
+            return False
 
     def _hermes_zone(self) -> Optional[tzinfo]:
         try:
@@ -153,7 +175,7 @@ class Handlers:
         kanban tools: one kanban_list call for the board, kanban_show for a few tasks' runs.
         Note: Hermes's kanban_list first promotes tasks whose dependencies have cleared to
         ready (the same recompute the CLI's list does); nothing else is written."""
-        if self.dispatch is None:
+        if self.dispatch is None or not self._visible("kanban_list"):
             raise BadInput("kanban tools are not available in this session")
         list_args = {"assignee": assignee, "limit": _KANBAN_LIST_LIMIT}
         if board:
@@ -183,13 +205,29 @@ class Handlers:
             task_runs = shown.get("runs") if isinstance(shown, dict) else None
             return [r for r in task_runs if isinstance(r, dict)] if isinstance(task_runs, list) else []
 
+        who = assignee.strip().lower()
+
         def closed(task_runs) -> None:
-            for r in task_runs:
+            # Only this assignee's own attempts: a task's run list also holds the runs of other
+            # profiles (a reviewer's, or an earlier assignee's).
+            ordered = sorted((r for r in task_runs if _ts(r.get("started_at"))),
+                             key=lambda r: _ts(r.get("started_at")))
+            for i, r in enumerate(ordered):
+                profile = r.get("profile")
+                if isinstance(profile, str) and profile.strip() and profile.strip().lower() != who:
+                    continue
                 start, end = _ts(r.get("started_at")), _ts(r.get("ended_at"))
                 outcome = r.get("outcome")
                 if not start or not end or end < start or outcome not in _FAILED | _SUCCEEDED:
                     continue
-                runs.append(Run(started_at=start, duration_s=end - start, ok=outcome in _SUCCEEDED))
+                if outcome == "reclaimed" and _operator_reclaim(r):
+                    continue
+                ok = outcome in _SUCCEEDED
+                if outcome == "review_requested":
+                    verdict = next((later.get("outcome") for later in ordered[i + 1:]
+                                    if later.get("outcome") in _REVIEW_VERDICTS), None)
+                    ok = verdict != "changes_requested"
+                runs.append(Run(started_at=start, duration_s=end - start, ok=ok))
 
         budget = _KANBAN_SHOW_MAX
         for task in running:
@@ -370,8 +408,10 @@ class Handlers:
             if ok is None or not math.isfinite(seconds) or seconds <= 0:
                 return None
             role = child_role.strip()[:40] if isinstance(child_role, str) and child_role.strip() else "leaf"
+            # Runs on the parent's thread: wait at most a fraction of a second for the file.
             self.store.record(f"{SUBAGENT_LANE}:{role}", seconds, ok,
-                              started_at=self.clock() - seconds, source="subagent_stop")
+                              started_at=self.clock() - seconds, source="subagent_stop",
+                              wait_s=HOOK_WAIT_S)
         except Exception:
             pass
         return None
