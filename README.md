@@ -49,6 +49,7 @@ hermes plugins enable eta
 | Key | Default | What it does |
 |---|---|---|
 | `plugins.entries.eta.settings.timezone` | empty | IANA zone for answers, e.g. `America/New_York`. Empty means Hermes's own time zone (`timezone` in config.yaml, else the machine's local zone) |
+| `plugins.entries.eta.settings.read_history` | `true` | On first use, read past delegated subagent runs from Hermes's session history once (see Disclosure). `false` skips it; runs already read stay until trimmed |
 
 No setting is required. A zone that cannot be loaded (a typo, or a device with no time zone
 data) never fails the estimate: the answer falls back to Hermes's zone, then UTC, and says so.
@@ -114,6 +115,13 @@ how long one run takes once it starts, not when the schedule fires it.
   runs is a poor guide to the slow tail, so the worst case never assumes less than twice the
   typical run. One failure in one run is
   not "no honest ETA"; three failures in a row still is.
+- Past runs: on first use (the first estimate, `/eta` or `eta_history`, never the hook) it reads
+  the delegated subagent runs already in Hermes's session history, so subagent lanes have data
+  from day one. Only runs that ended before the hook's first recorded run are taken, so nothing
+  is counted twice. Because "likely" uses the last 24 hours when there are any, old history
+  mostly matters in the first days after install; on a synthetic two-year history the first 5
+  estimates per lane were answered 98% of the time instead of 83%, and later estimates were the
+  same with or without it.
 - No finished runs: if a run is in progress, a labelled rough guess from its elapsed time
   (as long again likely, three times as long again at the slow end, plus a retry when nothing
   says how often it fails). Otherwise, a labelled rough guess from other work recorded on this
@@ -146,6 +154,17 @@ how long one run takes once it starts, not when the schedule fires it.
     (`kanban.max_in_progress`, `kanban.max_in_progress_per_profile`; when the first is unset,
     Hermes's own default is derived from the machine's total memory).
   - whether Hermes offers the kanban tools here (Hermes's tool registry availability check).
+- Reads, once, on first use: Hermes's session history file (`<hermes home>/state.db`), to learn
+  from delegated subagent runs made before the plugin was installed. Hermes has no public plugin
+  API for this, so it opens the file with SQLite's read-only mode (`mode=ro`, `query_only`) and
+  never writes to it; SQLite itself may create its usual `-wal`/`-shm` coordination files next to
+  a database in WAL mode, as any reader does. From each `delegate_task` result and background
+  delegation it takes only the role, start, duration and success; never a goal, summary, message
+  text, tool trace or session id. It is bounded: at most 6,000 runs from the 4,000 newest
+  delegating sessions, a 1.5 second time budget, and at most a 0.2 second wait if Hermes is
+  writing. A busy store is tried again the next time Hermes starts; a missing, unreadable or
+  unrecognised one (another Hermes version) is skipped, and the answer says how many past runs
+  were read. Turn it off with `read_history: false`.
 - Blocks nothing and never asks for approval.
 
 ## Per surface

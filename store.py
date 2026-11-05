@@ -2,7 +2,8 @@
 
 Holds runs recorded with eta_record_run (CI, scripts, anything else) and, automatically, each
 delegated subagent run Hermes reports through the subagent_stop hook (lane "subagent:<role>",
-start time, duration, success flag; never the child's summary or tool calls). Kanban and cron
+start time, duration, success flag; never the child's summary or tool calls), plus, once, the
+same four fields for past delegated runs read from Hermes's session history (history.py). Kanban and cron
 history are not stored here; they are read live. Nothing here leaves the machine.
 """
 
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS runs (
     source TEXT NOT NULL DEFAULT 'manual'
 );
 CREATE INDEX IF NOT EXISTS runs_lane ON runs(lane, started_at);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
 
@@ -83,6 +85,40 @@ class RunStore:
             return True
         finally:
             self._lock.release()
+
+    def get_meta(self, key: str) -> Optional[str]:
+        with self._lock:
+            row = self._db().execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def first_end(self, source: str) -> Optional[float]:
+        """When the earliest run recorded from `source` ended (None if there is none)."""
+        with self._lock:
+            row = self._db().execute("SELECT MIN(started_at + duration_s) FROM runs WHERE source = ?",
+                                     (source,)).fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    def import_history(self, runs, meta_key: str, meta_value: str) -> int:
+        """Add past runs (lane, started_at, duration_s, ok) and mark the import done, in one
+        transaction, so a crash half-way leaves neither. Each lane is trimmed as record() does."""
+        rows = [(_clean_lane(lane), float(start), float(max(dur, 0)), 1 if ok else 0, "history")
+                for lane, start, dur, ok in runs]
+        with self._lock:
+            db = self._db()
+            try:
+                db.executemany("INSERT INTO runs(lane, started_at, duration_s, ok, source) VALUES (?,?,?,?,?)",
+                               rows)
+                for lane in {r[0] for r in rows}:
+                    db.execute(
+                        "DELETE FROM runs WHERE lane = ? AND id NOT IN "
+                        "(SELECT id FROM runs WHERE lane = ? ORDER BY started_at DESC LIMIT ?)",
+                        (lane, lane, MAX_ROWS_PER_LANE))
+                db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (meta_key, meta_value))
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+        return len(rows)
 
     def runs(self, lane: str) -> list[Run]:
         with self._lock:

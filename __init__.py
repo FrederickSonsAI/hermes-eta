@@ -4,7 +4,8 @@ Registers three tools (eta_estimate, eta_record_run, eta_history), the subagent_
 each delegated run's role, outcome and duration), an /eta slash command and a bundled skill.
 Kanban history is read live through Hermes's own kanban tools (ctx.dispatch_tool), so it is
 correct across profiles; cron history is read from Hermes's cron run ledger; everything else is
-recorded in the plugin's own SQLite file.
+recorded in the plugin's own SQLite file. On first use (never from a hook) past delegated runs are
+imported once, read-only and bounded, from Hermes's session store (history.py).
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from . import schemas
+from .history import read_delegated_runs
 from .store import RunStore
 from .tools import Handlers
 
@@ -65,6 +67,12 @@ def _hermes_cron_runs(job_id: str):
     return executions.list_executions(job_id=job_id, limit=50)
 
 
+def _hermes_state_db() -> Path:
+    """Hermes's session store for the active profile (hermes_state's default path)."""
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "state.db"
+
+
 def register(ctx):
     store = RunStore()
 
@@ -80,9 +88,21 @@ def register(ctx):
         except Exception:
             return None
 
+    def read_history_enabled():
+        try:
+            value = ctx.get_config("read_history", default=True)
+        except Exception:
+            return True
+        return value if isinstance(value, bool) else True
+
+    def history_reader(before):
+        # Read-only, bounded (row cap and time budget), never writes to Hermes's files.
+        return read_delegated_runs(_hermes_state_db(), before=before)
+
     h = Handlers(store, default_tz=default_tz, dispatch=ctx.dispatch_tool, host_tz=_hermes_tz,
                  dispatch_cap=_hermes_dispatch_cap, cron_reader=cron_reader,
-                 tool_visible=_hermes_tool_visible)
+                 tool_visible=_hermes_tool_visible, history_reader=history_reader,
+                 history_enabled=read_history_enabled)
 
     ctx.register_tool(name="eta_estimate", toolset=TOOLSET, schema=schemas.ETA_ESTIMATE,
                       handler=h.eta_estimate)

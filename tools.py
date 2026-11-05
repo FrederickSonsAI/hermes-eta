@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import shlex
+import threading
 import time
 from datetime import datetime, timezone, tzinfo
 from typing import Callable, Optional
@@ -44,6 +45,9 @@ SUBAGENT_LANE = "subagent"
 _SUBAGENT_STATUSES = {"completed": True, "failed": False, "error": False, "timeout": False}
 # The hook never holds the parent's delegation up longer than this waiting for the SQLite file.
 HOOK_WAIT_S = 0.25
+# Marks the one-time import of past delegated runs from Hermes's session history (history.py).
+HISTORY_KEY = "history_backfill"
+_TRANSIENT = {"session store busy or unreadable", "time budget reached"}
 
 
 class BadInput(ValueError):
@@ -120,8 +124,14 @@ class Handlers:
                  host_tz: Callable[[], Optional[tzinfo]] = lambda: None,
                  dispatch_cap: Callable[[], Optional[int]] = lambda: None,
                  cron_reader: Optional[Callable[[str], Optional[list]]] = None,
-                 tool_visible: Callable[[str], bool] = lambda name: True):
+                 tool_visible: Callable[[str], bool] = lambda name: True,
+                 history_reader: Optional[Callable[[Optional[float]], dict]] = None,
+                 history_enabled: Callable[[], bool] = lambda: True):
         self.store = store
+        self.history_reader = history_reader
+        self.history_enabled = history_enabled
+        self._history_done = False
+        self._history_lock = threading.Lock()
         self.default_tz = default_tz
         self.clock = clock
         self.dispatch = dispatch
@@ -129,6 +139,49 @@ class Handlers:
         self.dispatch_cap = dispatch_cap
         self.cron_reader = cron_reader
         self.tool_visible = tool_visible
+
+    def ensure_history(self) -> Optional[str]:
+        """First use only: import past delegated runs from Hermes's session history, read-only,
+        so a long-used Hermes has estimates from day one. Runs that ended after the first run the
+        hook recorded are left out (the hook has them). Done once per profile (marked in the
+        plugin's own store); a busy or locked session store is retried in the next process.
+        Returns a one-line note for the answer when this call did the import. Never raises."""
+        if self._history_done or self.history_reader is None:
+            return None
+        if not self._history_lock.acquire(blocking=False):
+            return None  # another thread is importing right now
+        try:
+            if self._history_done:
+                return None
+            try:
+                if not self.history_enabled():
+                    return None
+            except Exception:
+                pass
+            if self.store.get_meta(HISTORY_KEY) is not None:
+                self._history_done = True
+                return None
+            self._history_done = True  # one attempt per process, whatever happens next
+            before = self.store.first_end("subagent_stop") or self.clock()
+            result = self.history_reader(before) or {}
+            runs = result.get("runs") or []
+            reason = result.get("reason")
+            if reason in _TRANSIENT and not runs:
+                return None  # not marked done: the next process tries again
+            n = self.store.import_history(runs, HISTORY_KEY, json.dumps({
+                "at": self.clock(), "imported": len(runs), "partial": bool(result.get("partial")),
+                "reason": reason}))
+            if not n:
+                return None
+            note = (f"Read {n} past delegated run{'' if n == 1 else 's'} from this Hermes's session "
+                    "history (read-only, once).")
+            if result.get("partial"):
+                note += " Only the newest were read" + (f" ({reason})." if reason else ".")
+            return note
+        except Exception:
+            return None
+        finally:
+            self._history_lock.release()
 
     def _visible(self, name: str) -> bool:
         """Whether Hermes would offer tool `name` here (its own availability check). The kanban
@@ -292,13 +345,14 @@ class Handlers:
             running_min = _num(args, "running_minutes", float, lo=0)
             waiting = (args.get("waiting_on") or "").strip() or None
 
+            history_note = self.ensure_history()
             now_s = self.clock()
             now_dt = datetime.fromtimestamp(now_s, timezone.utc)
             tz, tz_name, tz_source, tz_note = self._zone(args, now_dt)
             lane = (args.get("lane") or "").strip()
             assignee = (args.get("kanban_assignee") or "").strip()
             cron_job = (args.get("cron_job") or "").strip()
-            notes, sources = [], []
+            notes, sources = ([history_note] if history_note else []), []
             runs: list[Run] = []
             elapsed: list[float] = []
             quiet = 0
@@ -433,11 +487,20 @@ class Handlers:
 
     def eta_history(self, args: dict, **kwargs) -> str:
         try:
+            note = self.ensure_history()
             lane = (args.get("lane") or "").strip()
             lanes = [lane] if lane else self.store.lanes()
             now_s = self.clock()
-            return json.dumps({"lanes": {name: _stats_dict(lane_stats(self.store.runs(name), now_s))
-                                         for name in lanes}})
+            out = {"lanes": {name: _stats_dict(lane_stats(self.store.runs(name), now_s)) for name in lanes}}
+            imported = self.store.get_meta(HISTORY_KEY)
+            if imported:
+                try:
+                    out["history_import"] = json.loads(imported)
+                except ValueError:
+                    pass
+            if note:
+                out["notes"] = [note]
+            return json.dumps(out)
         except Exception as exc:
             return json.dumps({"error": f"eta_history failed: {exc}"})
 
@@ -458,7 +521,7 @@ class Handlers:
                 return data["error"]
             if not data.get("lanes"):
                 return "No runs recorded yet. " + usage
-            lines = []
+            lines = list(data.get("notes") or [])
             for name, st in data["lanes"].items():
                 ok = "n/a" if st["success_rate"] is None else f"{round(st['success_rate'] * 100)}%"
                 typical = (f"typical {st['median_run_minutes']} min"

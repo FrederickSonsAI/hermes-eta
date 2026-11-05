@@ -19,3 +19,8 @@ config_schema:
     default: ""
     label: "Time zone"
     description: "IANA time zone for answers, e.g. America/New_York. Empty means Hermes's own time zone."
+  read_history:
+    type: bool
+    default: true
+    label: "Learn from past runs"
+    description: "On first use, read past delegated subagent runs (role, start, duration, success only) from Hermes's session history, once and read-only, so estimates work from day one. false skips it."
