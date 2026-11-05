@@ -63,10 +63,46 @@ def test_daily_cap_pushes_past_reset(pkg):
     assert "cap" in r.biggest_risk
 
 
-def test_zero_cap_does_not_loop_forever(pkg):
+def test_zero_cap_is_unbounded(pkg):
     from eta_plugin import estimator as e
     r = e.estimate(remaining_items=5, avg_run_s=60, success_rate=1.0, daily_run_cap=0, now=NOW)
-    assert r.likely_at is not None  # bounded by the 366-day guard
+    assert r.status == "unbounded"
+
+
+def test_tiny_cap_over_a_year_is_unbounded(pkg):
+    from eta_plugin import estimator as e
+    r = e.estimate(remaining_items=1000, avg_run_s=60, success_rate=1.0, daily_run_cap=1, now=NOW)
+    assert r.status == "unbounded" and "year" in r.headline
+
+
+def test_far_dates_show_year(pkg):
+    from eta_plugin import estimator as e
+    r = e.estimate(remaining_items=30, avg_run_s=60, success_rate=1.0, daily_run_cap=2, now=NOW)
+    assert "2026" in r.headline
+
+
+def test_dst_change_is_exact(pkg):
+    from datetime import timedelta
+    from eta_plugin import estimator as e
+    tz = ZoneInfo("America/New_York")
+    start = datetime(2026, 11, 1, 4, 30, tzinfo=timezone.utc)  # 00:30 EDT; clocks fall back at 2 AM
+    r = e.estimate(remaining_items=18, avg_run_s=600, success_rate=1.0, now=start, tz=tz)
+    assert r.likely_at - start == timedelta(hours=3)
+    assert r.likely_at.strftime("%H:%M %Z") == "02:30 EST"
+
+
+def test_allowance_without_daily_cap_resumes_after_reset(pkg):
+    from eta_plugin import estimator as e
+    tz = ZoneInfo("America/New_York")
+    r = e.estimate(remaining_items=4, avg_run_s=600, success_rate=1.0, runs_left_today=2,
+                   reset_hour=0, now=NOW, tz=tz)
+    assert r.likely_at.astimezone(tz).date() > NOW.astimezone(tz).date()
+
+
+def test_same_time_range_reads_cleanly(pkg):
+    from eta_plugin import estimator as e
+    now = NOW.astimezone(ZoneInfo("America/New_York"))
+    assert e.describe_range(now, now, now).startswith("Likely around")
 
 
 def test_no_data(pkg):

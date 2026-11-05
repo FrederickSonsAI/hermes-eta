@@ -23,41 +23,82 @@ def _register(pkg, fake_ctx, monkeypatch):
 def test_register_matches_manifest(pkg, fake_ctx, monkeypatch):
     ctx = _register(pkg, fake_ctx, monkeypatch)
     assert sorted(ctx.tools) == _manifest_list("provides_tools")
-    assert sorted(ctx.hooks) == _manifest_list("provides_hooks")
+    assert ctx.hooks == {}
+    assert "provides_hooks" not in (ROOT / "plugin.yaml").read_text()
     assert "eta" in ctx.commands and "eta" in ctx.skills
 
 
-def test_kanban_hooks_record_history(pkg, fake_ctx, monkeypatch):
-    ctx = _register(pkg, fake_ctx, monkeypatch)
-    for i in range(4):
-        ctx.hooks["kanban_task_claimed"](task_id=f"t{i}", board="b", assignee="writer", run_id=1,
-                                         profile_name="default")
-        name = "kanban_task_completed" if i < 3 else "kanban_task_blocked"
-        ctx.hooks[name](task_id=f"t{i}", board="b", assignee="writer", run_id=1,
-                        profile_name="default", summary=None, reason="x")
-    hist = json.loads(ctx.tools["eta_history"]({"lane": "writer"}))
-    s = hist["lanes"]["writer"]
-    assert s["runs_total"] == 4 and s["success_rate"] == 0.75 and s["fail_streak"] == 1
+class FakeKanban:
+    """Stands in for Hermes's kanban_list / kanban_show tools."""
+
+    def __init__(self, now):
+        self.calls = []
+        day = 86400
+        self.tasks = [
+            {"id": "d1", "status": "done", "started_at": now - day, "completed_at": now - day + 600},
+            {"id": "d2", "status": "done", "started_at": now - 7200, "completed_at": now - 6600},
+            {"id": "o1", "status": "ready"}, {"id": "o2", "status": "todo"},
+            {"id": "o3", "status": "running"}, {"id": "b1", "status": "blocked"},
+        ]
+        self.runs = {
+            "d1": [{"started_at": now - day, "ended_at": now - day + 600, "outcome": "completed"}],
+            "d2": [{"started_at": now - 9000, "ended_at": now - 8400, "outcome": "crashed"},
+                   {"started_at": now - 7200, "ended_at": now - 6600, "outcome": "completed"},
+                   {"started_at": now - 6000, "ended_at": None, "outcome": None}],
+        }
+
+    def __call__(self, name, args, **kw):
+        self.calls.append((name, args))
+        if name == "kanban_list":
+            assert args["assignee"] == "writer"
+            return json.dumps({"tasks": self.tasks, "count": len(self.tasks), "truncated": False})
+        if name == "kanban_show":
+            return {"runs": self.runs.get(args["task_id"], [])}  # the registry may return a dict
+        return json.dumps({"error": "Unknown tool"})
 
 
-def test_hook_without_claim_still_counts(pkg, fake_ctx, monkeypatch):
-    ctx = _register(pkg, fake_ctx, monkeypatch)
-    ctx.hooks["kanban_task_completed"](task_id="z", board=None, assignee=None, run_id=None)
-    hist = json.loads(ctx.tools["eta_history"]({}))
-    assert hist["lanes"]["kanban"]["runs_total"] == 1
+NOW = 1_793_900_000.0
 
 
-def test_hooks_never_raise(pkg, fake_ctx, monkeypatch):
-    ctx = _register(pkg, fake_ctx, monkeypatch)
+def _handlers(store, dispatch=None, now=NOW, tz=None):
+    from eta_plugin.tools import Handlers
+    return Handlers(store, default_tz=lambda: tz, clock=lambda: now, dispatch=dispatch)
+
+
+def test_kanban_live_read(store):
+    fk = FakeKanban(NOW)
+    out = json.loads(_handlers(store, fk, tz="America/New_York").eta_estimate(
+        {"kanban_assignee": "writer", "lanes": 2}))
+    assert out["status"] == "ok", out
+    assert out["key_numbers"]["remaining_items"] == 3  # ready, todo, running; blocked excluded
+    assert out["key_numbers"]["success_rate"] == round(2 / 3, 3)  # crash counts, open run ignored
+    assert any("blocked" in n for n in out["notes"])
+    assert [c[0] for c in fk.calls].count("kanban_show") == 2
+
+
+def test_kanban_unavailable_is_clean_error(store):
+    h = _handlers(store, lambda *a, **k: json.dumps({"error": "Unknown tool: kanban_list"}))
+    assert "kanban toolset" in json.loads(h.eta_estimate({"kanban_assignee": "writer"}))["error"]
+    assert "not available" in json.loads(_handlers(store).eta_estimate({"kanban_assignee": "x"}))["error"]
+
+
+def test_only_blocked_work_waits_on_person(store):
+    fk = FakeKanban(NOW)
+    fk.tasks = [t for t in fk.tasks if t["status"] in {"done", "blocked"}]
+    out = json.loads(_handlers(store, fk).eta_estimate({"kanban_assignee": "writer"}))
+    assert out["status"] == "done"
+    assert any("blocked" in n for n in out["notes"])
+
+
+def test_db_failure_never_raises(pkg, fake_ctx, monkeypatch):
     from eta_plugin import store as store_mod
 
     def boom():
         raise RuntimeError("db gone")
     monkeypatch.setattr(store_mod, "_default_connect", boom)
-    fresh = type(fake_ctx)()
-    pkg.register(fresh)
-    fresh.hooks["kanban_task_claimed"](task_id="a")
-    assert "error" in json.loads(fresh.tools["eta_history"]({}))
+    pkg.register(fake_ctx)
+    assert "error" in json.loads(fake_ctx.tools["eta_history"]({}))
+    assert "error" in json.loads(fake_ctx.tools["eta_estimate"]({"lane": "x", "remaining_items": 1}))
 
 
 def test_estimate_tool_end_to_end(pkg, fake_ctx, monkeypatch):
@@ -77,13 +118,23 @@ def test_estimate_tool_bad_input(pkg, fake_ctx, monkeypatch):
     assert "error" in json.loads(ctx.tools["eta_estimate"]({}))
     assert "error" in json.loads(ctx.tools["eta_estimate"]({"remaining_items": 2, "timezone": "Mars/Base"}))
     assert "error" in json.loads(ctx.tools["eta_record_run"]({"lane": "x"}))
+    assert "error" in json.loads(ctx.tools["eta_record_run"]({"lane": "x", "duration_minutes": -3, "ok": True}))
     assert "error" in json.loads(ctx.tools["eta_estimate"]({"remaining_items": "lots"}))
+    bad = [{"avg_run_minutes": -5}, {"avg_run_minutes": 0}, {"success_rate": 1.5},
+           {"review_minutes": -1}, {"lanes": 0}, {"reset_hour": 24}, {"remaining_items": -1},
+           {"avg_run_minutes": "nan"}, {"daily_run_cap": -1}]
+    for extra in bad:
+        args = {"remaining_items": 2, "avg_run_minutes": 5, **extra}
+        assert "error" in json.loads(ctx.tools["eta_estimate"](args)), extra
 
 
 def test_slash_command(pkg, fake_ctx, monkeypatch):
     ctx = _register(pkg, fake_ctx, monkeypatch)
     assert "No runs recorded" in ctx.commands["eta"]("")
     ctx.tools["eta_record_run"]({"lane": "docs", "duration_minutes": 5, "ok": True})
-    assert "docs:" in ctx.commands["eta"]("")
+    ctx.tools["eta_record_run"]({"lane": "nodur", "duration_minutes": 0, "ok": True})
+    listing = ctx.commands["eta"]("")
+    assert "docs:" in listing and "no durations yet" in listing and "None" not in listing
     assert ctx.commands["eta"]("docs 3 1").startswith("Likely")
     assert ctx.commands["eta"]("docs").startswith("Usage")
+    assert "kanban" in ctx.commands["eta"]("@writer")  # fake ctx has no kanban tools

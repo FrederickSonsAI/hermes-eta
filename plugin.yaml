@@ -11,10 +11,6 @@ provides_tools:
   - eta_estimate
   - eta_record_run
   - eta_history
-provides_hooks:
-  - kanban_task_claimed
-  - kanban_task_completed
-  - kanban_task_blocked
 config_schema:
   timezone:
     type: str

@@ -54,6 +54,9 @@ class FakeCtx:
     def get_config(self, key, default=None):
         return self.config.get(key, default)
 
+    def dispatch_tool(self, name, args, **kw):
+        return '{"error": "Unknown tool: %s"}' % name
+
 
 @pytest.fixture
 def fake_ctx():

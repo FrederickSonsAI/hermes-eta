@@ -21,6 +21,8 @@ STUCK_STREAK = 3
 MIN_SUCCESS_RATE = 0.15
 # With fewer samples than this, say the estimate is low-confidence.
 LOW_SAMPLES = 5
+# Past this many days of capped work there is no useful ETA.
+MAX_DAYS = 366
 
 
 @dataclass
@@ -87,34 +89,55 @@ def lane_stats(runs: list[Run], now: float, window_s: float = 24 * 3600) -> Lane
     )
 
 
-def _next_reset(after: datetime, reset_hour: int) -> datetime:
-    candidate = after.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
-    if candidate <= after:
-        candidate += timedelta(days=1)
-    return candidate
+def _next_reset(after_utc: datetime, reset_hour: int, tz: tzinfo) -> datetime:
+    """Next local `reset_hour` strictly after `after_utc`, returned in UTC (DST-safe)."""
+    local = after_utc.astimezone(tz)
+    candidate = datetime(local.year, local.month, local.day, reset_hour, tzinfo=tz)
+    if candidate.astimezone(timezone.utc) <= after_utc:
+        nxt = local.date() + timedelta(days=1)
+        candidate = datetime(nxt.year, nxt.month, nxt.day, reset_hour, tzinfo=tz)
+    return candidate.astimezone(timezone.utc)
 
 
-def _finish_time(start: datetime, runs: int, run_s: float, lanes: int,
+def _finish_time(start_utc: datetime, runs: int, run_s: float, lanes: int,
                  runs_left_today: Optional[int], daily_cap: Optional[int],
-                 reset_hour: int) -> datetime:
-    """Walk forward through daily cap windows. Within a window, runs go `lanes` at a time."""
-    t = start
+                 reset_hour: int, tz: tzinfo) -> datetime:
+    """Runs go `lanes` at a time. A daily cap pushes the rest past each reset.
+    All arithmetic is in UTC so DST changes never shift the answer."""
+    t = start_utc
     remaining = runs
     budget = runs_left_today if runs_left_today is not None else daily_cap
-    for _ in range(366):  # hard stop: never loop forever
-        if remaining <= 0:
-            return t
-        if budget is None:
-            batch = remaining
-        else:
-            batch = min(remaining, max(budget, 0))
-        if batch > 0:
-            t = t + timedelta(seconds=math.ceil(batch / lanes) * run_s)
-            remaining -= batch
-        if remaining > 0:
-            t = max(t, _next_reset(t, reset_hour))
-            budget = daily_cap
-    return t
+    if budget is not None and budget > 0:
+        batch = min(remaining, budget)
+        t += timedelta(seconds=math.ceil(batch / lanes) * run_s)
+        remaining -= batch
+    if remaining <= 0:
+        return t
+    if daily_cap is None:
+        if runs_left_today is not None:  # today's allowance is spent; the rest waits for the reset
+            t = _next_reset(t, reset_hour, tz)
+        return t + timedelta(seconds=math.ceil(remaining / lanes) * run_s)
+    # daily_cap > 0 here (estimate() rejects 0). Whole days of capped work, then the tail.
+    full_days, tail = divmod(remaining, daily_cap)
+    if tail == 0:
+        full_days, tail = full_days - 1, daily_cap
+    if full_days > MAX_DAYS:
+        raise OverflowError("more than a year of capped work")
+    reset = _next_reset(t, reset_hour, tz)
+    for _ in range(full_days):
+        reset = _next_reset(reset, reset_hour, tz)
+    return reset + timedelta(seconds=math.ceil(tail / lanes) * run_s)
+
+
+def _range(now_utc, now, tz, queue_ahead, runs_needed, runs_worst, med, slow, lanes,
+           runs_left_today, daily_run_cap, reset_hour, review_s):
+    likely = (_finish_time(now_utc, queue_ahead + runs_needed, med, lanes, runs_left_today,
+                           daily_run_cap, reset_hour, tz) + timedelta(seconds=review_s)).astimezone(tz)
+    worst = (_finish_time(now_utc, queue_ahead + runs_worst, slow, lanes, runs_left_today,
+                          daily_run_cap, reset_hour, tz) + timedelta(seconds=review_s * 2)).astimezone(tz)
+    if worst <= likely:
+        worst = likely + timedelta(minutes=max(5, (likely - now).total_seconds() / 600))
+    return likely, worst
 
 
 def estimate(*, remaining_items: int, stats: Optional[LaneStats] = None,
@@ -125,7 +148,8 @@ def estimate(*, remaining_items: int, stats: Optional[LaneStats] = None,
              now: Optional[datetime] = None, tz: Optional[tzinfo] = None) -> Estimate:
     """Compute an ETA. Explicit arguments override what `stats` says."""
     tz = tz or timezone.utc
-    now = (now or datetime.now(timezone.utc)).astimezone(tz)
+    now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now = now_utc.astimezone(tz)
     lanes = max(int(lanes or 1), 1)
     queue_ahead = max(int(queue_ahead or 0), 0)
 
@@ -150,6 +174,12 @@ def estimate(*, remaining_items: int, stats: Optional[LaneStats] = None,
     if runs_left_today is not None:
         numbers["runs_left_today"] = runs_left_today
 
+    if daily_run_cap == 0:
+        return Estimate(
+            status="unbounded",
+            headline="No honest ETA: the daily run cap is 0, so nothing can run.",
+            key_numbers=numbers, biggest_risk="The run cap.")
+
     if streak >= STUCK_STREAK or (sr is not None and sr < MIN_SUCCESS_RATE):
         why = (f"the last {streak} runs failed in a row" if streak >= STUCK_STREAK
                else f"only {round((sr or 0) * 100)}% of recent runs succeed")
@@ -171,14 +201,15 @@ def estimate(*, remaining_items: int, stats: Optional[LaneStats] = None,
     runs_worst = math.ceil(remaining_items / sr_worst) if remaining_items > 0 else 0
     numbers["runs_needed"] = runs_needed
 
-    start = now
-    clock = None
-    if waiting_on_person:
-        clock = waiting_on_person
-    likely = _finish_time(start, queue_ahead + runs_needed, med, lanes, runs_left_today,
-                          daily_run_cap, reset_hour) + timedelta(seconds=review_s)
-    worst = _finish_time(start, queue_ahead + runs_worst, p90 or med * 1.5, lanes,
-                         runs_left_today, daily_run_cap, reset_hour) + timedelta(seconds=review_s * 2)
+    clock = waiting_on_person or None
+    slow = max(p90 or med * 1.5, med)
+    try:
+        likely, worst = _range(now_utc, now, tz, queue_ahead, runs_needed, runs_worst, med, slow,
+                               lanes, runs_left_today, daily_run_cap, reset_hour, review_s)
+    except OverflowError:
+        return Estimate(status="unbounded",
+                        headline="No honest ETA: at this run cap the work takes more than a year.",
+                        key_numbers=numbers, biggest_risk="The daily run cap.")
 
     risk = None
     if daily_run_cap is not None or runs_left_today is not None:
@@ -222,10 +253,14 @@ def _day(dt: datetime, now: datetime) -> str:
         return "today"
     if days == 1:
         return "tomorrow"
-    return dt.strftime("%a %b %d").replace(" 0", " ")
+    if days < 7:
+        return dt.strftime("%a %b %d").replace(" 0", " ")
+    return dt.strftime("%b %d, %Y").replace(" 0", " ")
 
 
 def describe_range(likely: datetime, worst: datetime, now: datetime) -> str:
+    if _clock(likely) == _clock(worst) and _day(likely, now) == _day(worst, now):
+        return f"Likely around {_clock(likely)} {_day(likely, now)}."
     if _day(likely, now) == _day(worst, now):
         return f"Likely between {_clock(likely)} and {_clock(worst)} {_day(likely, now)}."
     return f"Likely {_clock(likely)} {_day(likely, now)}, {_clock(worst)} {_day(worst, now)} at worst."

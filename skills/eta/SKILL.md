@@ -15,14 +15,15 @@ Never repeat an earlier ETA without recomputing it.
   on a person has no clock: say so, and estimate from the moment they act.
 
 ## 2. Pull live numbers
-- `eta_history` shows each lane's runs in the last 3h and 24h, success rate, typical and slow run
-  length, and the current failure streak. Kanban tasks are recorded automatically; record other
-  work with `eta_record_run` as it finishes.
+- For kanban work, `eta_estimate` with `kanban_assignee` reads open tasks and past runs live.
+- For other work, `eta_history` shows each lane's runs in the last 3h and 24h, success rate,
+  typical and slow run length and the current failure streak. Record runs with `eta_record_run`
+  as they finish.
 - Count how much work is left and how many runs are queued ahead of it.
 - Note limits: how many runs can go at once, any daily run or budget cap and when it resets.
 
 ## 3. Compute
-- Call `eta_estimate` with `remaining_items`, the `lane`, and any number you know better
+- Call `eta_estimate` with `remaining_items` and the `lane` (or `kanban_assignee`), and any number you know better
   (`queue_ahead`, `lanes`, `daily_run_cap`, `runs_left_today`, `reset_hour`, `review_minutes`,
   `waiting_on`, `timezone`).
 - Runs needed = remaining items / success rate. Time = (runs ahead + runs needed) x typical run

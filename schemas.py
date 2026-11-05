@@ -6,7 +6,8 @@ ETA_ESTIMATE = {
         "Estimate when a piece of agent work will finish, as a time range (likely and worst "
         "case), from real run history. Use it whenever the user asks 'when will this be done', "
         "'how long', or for an ETA on a task, queue, job, agent or kanban board. Pass the lane "
-        "(the agent, assignee or queue doing the work) to use its recorded runs, and override "
+        "(the agent or queue doing the work) to use its recorded runs, or kanban_assignee to read a "
+        "kanban assignee's open tasks and past runs live, and override "
         "any number you know better. Returns 'unbounded' instead of a time when the work keeps "
         "failing, and 'blocked_on_person' when a step waits on a human. Always recompute: never "
         "repeat an earlier ETA."
@@ -15,7 +16,12 @@ ETA_ESTIMATE = {
         "type": "object",
         "properties": {
             "remaining_items": {"type": "integer", "minimum": 0,
-                                "description": "Units of work left (tasks, steps or jobs)."},
+                                "description": "Units of work left (tasks, steps or jobs). Optional "
+                                               "with kanban_assignee: open tasks are counted."},
+            "kanban_assignee": {"type": "string",
+                                "description": "Kanban assignee (profile) whose board history and open "
+                                               "tasks to read live through the kanban tools."},
+            "board": {"type": "string", "description": "Kanban board slug (default: current board)."},
             "lane": {"type": "string",
                      "description": "Agent, kanban assignee or queue name whose history to use."},
             "queue_ahead": {"type": "integer", "minimum": 0,
@@ -39,7 +45,7 @@ ETA_ESTIMATE = {
             "waiting_on": {"type": "string",
                            "description": "A step that waits on a person, e.g. 'you approve the PR'."},
         },
-        "required": ["remaining_items"],
+        "required": [],
     },
 }
 
