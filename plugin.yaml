@@ -1,0 +1,23 @@
+name: eta
+version: "0.1.0"
+manifest_version: 2
+api_version: 1
+description: Honest finish-time estimates for agent work, computed from real run history instead of guesses
+author: Frederick & Sons
+license: MIT
+requires_hermes: ">=0.22.7"
+tags: [automation, kanban, planning, estimates]
+provides_tools:
+  - eta_estimate
+  - eta_record_run
+  - eta_history
+provides_hooks:
+  - kanban_task_claimed
+  - kanban_task_completed
+  - kanban_task_blocked
+config_schema:
+  timezone:
+    type: str
+    default: ""
+    label: "Time zone"
+    description: "IANA time zone for answers, e.g. America/New_York. Empty means UTC."
