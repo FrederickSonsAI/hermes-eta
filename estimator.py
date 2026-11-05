@@ -104,29 +104,33 @@ def _finish_time(start_utc: datetime, runs: int, run_s: float, lanes: int,
                  reset_hour: int, tz: tzinfo) -> datetime:
     """Runs go `lanes` at a time. A daily cap pushes the rest past each reset.
     All arithmetic is in UTC so DST changes never shift the answer."""
+    def span(n: int) -> timedelta:
+        return timedelta(seconds=math.ceil(n / lanes) * run_s)
+
     t = start_utc
     remaining = runs
     budget = runs_left_today if runs_left_today is not None else daily_cap
-    if budget is not None and budget > 0:
+    if budget is None:
+        return t + span(remaining)
+    if budget > 0:
         batch = min(remaining, budget)
-        t += timedelta(seconds=math.ceil(batch / lanes) * run_s)
+        t += span(batch)
         remaining -= batch
     if remaining <= 0:
         return t
-    if daily_cap is None:
-        if runs_left_today is not None:  # today's allowance is spent; the rest waits for the reset
-            t = _next_reset(t, reset_hour, tz)
-        return t + timedelta(seconds=math.ceil(remaining / lanes) * run_s)
-    # daily_cap > 0 here (estimate() rejects 0). Whole days of capped work, then the tail.
-    full_days, tail = divmod(remaining, daily_cap)
-    if tail == 0:
-        full_days, tail = full_days - 1, daily_cap
-    if full_days > MAX_DAYS:
-        raise OverflowError("more than a year of capped work")
-    reset = _next_reset(t, reset_hour, tz)
-    for _ in range(full_days):
-        reset = _next_reset(reset, reset_hour, tz)
-    return reset + timedelta(seconds=math.ceil(tail / lanes) * run_s)
+    window = start_utc
+    for _ in range(MAX_DAYS):
+        # The next window opens at the next reset, or when the last batch finishes if that
+        # batch ran past the reset (a big cap with slow runs can take longer than a day).
+        window = max(t, _next_reset(window, reset_hour, tz))
+        if daily_cap is None:  # only today's allowance was limited
+            return window + span(remaining)
+        batch = min(remaining, daily_cap)
+        t = window + span(batch)
+        remaining -= batch
+        if remaining <= 0:
+            return t
+    raise OverflowError("more than a year of capped work")
 
 
 def _range(now_utc, now, tz, queue_ahead, runs_needed, runs_worst, med, slow, lanes,

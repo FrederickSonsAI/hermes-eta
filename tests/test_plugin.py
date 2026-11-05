@@ -43,6 +43,7 @@ class FakeKanban:
         self.runs = {
             "d1": [{"started_at": now - day, "ended_at": now - day + 600, "outcome": "completed"}],
             "d2": [{"started_at": now - 9000, "ended_at": now - 8400, "outcome": "crashed"},
+                   {"started_at": 0, "ended_at": now - 8000, "outcome": "crashed"},
                    {"started_at": now - 7200, "ended_at": now - 6600, "outcome": "completed"},
                    {"started_at": now - 6000, "ended_at": None, "outcome": None}],
         }
@@ -50,8 +51,9 @@ class FakeKanban:
     def __call__(self, name, args, **kw):
         self.calls.append((name, args))
         if name == "kanban_list":
-            assert args["assignee"] == "writer"
-            return json.dumps({"tasks": self.tasks, "count": len(self.tasks), "truncated": False})
+            assert args["assignee"] == "writer" and args.get("status")
+            rows = [t for t in self.tasks if t["status"] == args["status"]]
+            return json.dumps({"tasks": rows, "count": len(rows), "truncated": False})
         if name == "kanban_show":
             return {"runs": self.runs.get(args["task_id"], [])}  # the registry may return a dict
         return json.dumps({"error": "Unknown tool"})
@@ -138,3 +140,10 @@ def test_slash_command(pkg, fake_ctx, monkeypatch):
     assert ctx.commands["eta"]("docs 3 1").startswith("Likely")
     assert ctx.commands["eta"]("docs").startswith("Usage")
     assert "kanban" in ctx.commands["eta"]("@writer")  # fake ctx has no kanban tools
+
+
+def test_review_requested_counts_as_success(store):
+    fk = FakeKanban(NOW)
+    fk.runs["d1"][0]["outcome"] = "review_requested"
+    out = json.loads(_handlers(store, fk).eta_estimate({"kanban_assignee": "writer"}))
+    assert out["key_numbers"]["success_rate"] == round(2 / 3, 3)

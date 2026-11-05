@@ -128,3 +128,10 @@ def test_window_falls_back_to_all_history(pkg):
     old = [e.Run(started_at=T - 5 * 86400, duration_s=300, ok=True)]
     s = e.lane_stats(old, T)
     assert s.success_rate == 1.0 and s.runs_24h == 0 and s.median_duration_s == 300
+
+
+def test_cap_never_beats_no_cap(pkg):
+    from eta_plugin import estimator as e
+    free = e.estimate(remaining_items=300, avg_run_s=1800, success_rate=1.0, now=NOW)
+    capped = e.estimate(remaining_items=300, avg_run_s=1800, success_rate=1.0, daily_run_cap=100, now=NOW)
+    assert capped.likely_at >= free.likely_at

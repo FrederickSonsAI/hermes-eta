@@ -36,10 +36,11 @@ It also shows in the Desktop under Settings, Plugins.
 ## Kanban, live
 
 `eta_estimate(kanban_assignee="writer")` (or `/eta @writer`) calls Hermes's own `kanban_list`
-and `kanban_show` tools through `ctx.dispatch_tool`, so it goes through the same approvals and
-scoping as any tool call and works across profiles. Open tasks (triage, todo, scheduled, ready,
-running, review) are the remaining work; runs that ended `completed` count as successes and
-`crashed`, `timed_out`, `spawn_failed` or `gave_up` as failures. Blocked tasks usually wait on a
+and `kanban_show` tools through `ctx.dispatch_tool`. Both are read-only, and the board is shared,
+so it works across profiles. Open tasks (triage, todo, scheduled, ready,
+running, review) are the remaining work; runs that ended `completed` or
+`review_requested` count as successes and `crashed`, `timed_out`, `spawn_failed` or `gave_up` as
+failures. Blocked tasks usually wait on a
 person, so they are reported, not counted as failures. This needs the kanban toolset in the
 session (an orchestrator profile).
 

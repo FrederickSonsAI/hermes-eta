@@ -17,6 +17,8 @@ from .store import RunStore
 # "blocked" is neither: it usually means the task waits on a person.
 _OPEN = {"triage", "todo", "scheduled", "ready", "running", "review"}
 _FAILED = {"crashed", "timed_out", "spawn_failed", "gave_up"}
+# A run that hands work to review finished its attempt successfully.
+_SUCCEEDED = {"completed", "review_requested"}
 _KANBAN_HISTORY_TASKS = 15
 
 
@@ -94,22 +96,30 @@ class Handlers:
 
     def _kanban(self, assignee: str, board: Optional[str], **kwargs) -> dict:
         """Read open work and recent run history for one assignee through Hermes's own
-        kanban tools (same approvals and scoping as if the model had called them)."""
+        read-only kanban tools (kanban_list, kanban_show). Never writes to the board."""
         if self.dispatch is None:
             raise BadInput("kanban tools are not available in this session")
-        list_args = {"assignee": assignee, "limit": 200}
-        if board:
-            list_args["board"] = board
-        listing = _as_dict(self.dispatch("kanban_list", list_args, **kwargs))
-        if "error" in listing or "tasks" not in listing:
-            raise BadInput(f"kanban_list failed: {listing.get('error', 'no tasks field')}"
-                           " (is the kanban toolset enabled for this profile?)")
-        tasks = listing["tasks"]
-        open_tasks = [t for t in tasks if t.get("status") in _OPEN]
-        blocked = [t for t in tasks if t.get("status") == "blocked"]
-        running = [t for t in tasks if t.get("status") == "running"]
-        done = sorted((t for t in tasks if t.get("status") == "done"),
-                      key=lambda t: _ts(t.get("completed_at")) or 0, reverse=True)
+        def listed(status: str, limit: int) -> tuple[list, bool]:
+            list_args = {"assignee": assignee, "status": status, "limit": limit}
+            if board:
+                list_args["board"] = board
+            data = _as_dict(self.dispatch("kanban_list", list_args, **kwargs))
+            if "error" in data or "tasks" not in data:
+                raise BadInput(f"kanban_list failed: {data.get('error', 'no tasks field')}"
+                               " (is the kanban toolset enabled for this profile?)")
+            return data["tasks"], bool(data.get("truncated"))
+
+        open_tasks, truncated, running = [], False, []
+        for status in sorted(_OPEN):
+            rows, cut = listed(status, 200)
+            open_tasks += rows
+            truncated = truncated or cut
+            if status == "running":
+                running = rows
+        blocked, cut = listed("blocked", 200)
+        truncated = truncated or cut
+        done, _ = listed("done", 50)
+        done = sorted(done, key=lambda t: _ts(t.get("completed_at")) or 0, reverse=True)
         runs: list[Run] = []
         for task in done[:_KANBAN_HISTORY_TASKS]:
             try:
@@ -122,16 +132,16 @@ class Handlers:
                 for r in task_runs:
                     start, end = _ts(r.get("started_at")), _ts(r.get("ended_at"))
                     outcome = r.get("outcome")
-                    if start is None or end is None or outcome not in _FAILED | {"completed"}:
+                    if not start or not end or end < start or outcome not in _FAILED | _SUCCEEDED:
                         continue
-                    runs.append(Run(started_at=start, duration_s=max(end - start, 0),
-                                    ok=outcome == "completed"))
+                    runs.append(Run(started_at=start, duration_s=end - start,
+                                    ok=outcome in _SUCCEEDED))
             else:  # fall back to the task's own timestamps: one successful run
                 start, end = _ts(task.get("started_at")), _ts(task.get("completed_at"))
-                if start is not None and end is not None:
-                    runs.append(Run(started_at=start, duration_s=max(end - start, 0), ok=True))
+                if start and end and end >= start:
+                    runs.append(Run(started_at=start, duration_s=end - start, ok=True))
         return {"open": len(open_tasks), "blocked": len(blocked), "running": len(running),
-                "runs": runs, "truncated": bool(listing.get("truncated"))}
+                "runs": runs, "truncated": truncated}
 
     def eta_estimate(self, args: dict, **kwargs) -> str:
         try:
