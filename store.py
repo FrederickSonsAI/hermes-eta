@@ -100,12 +100,20 @@ class RunStore:
 
     def import_history(self, runs, meta_key: str, meta_value: str) -> int:
         """Add past runs (lane, started_at, duration_s, ok) and mark the import done, in one
-        transaction, so a crash half-way leaves neither. Each lane is trimmed as record() does."""
+        transaction, so a crash half-way leaves neither. Each lane is trimmed as record() does.
+        The mark is claimed first, in the same write transaction, so two Hermes processes of one
+        profile (say the gateway and a CLI) that both reach first use import only once: the
+        second waits for the first's write lock, finds the mark, adds nothing and returns 0."""
         rows = [(_clean_lane(lane), float(start), float(max(dur, 0)), 1 if ok else 0, "history")
                 for lane, start, dur, ok in runs]
         with self._lock:
             db = self._db()
             try:
+                claimed = db.execute("INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
+                                     (meta_key, meta_value)).rowcount
+                if claimed != 1:
+                    db.rollback()
+                    return 0
                 db.executemany("INSERT INTO runs(lane, started_at, duration_s, ok, source) VALUES (?,?,?,?,?)",
                                rows)
                 for lane in {r[0] for r in rows}:
@@ -113,7 +121,6 @@ class RunStore:
                         "DELETE FROM runs WHERE lane = ? AND id NOT IN "
                         "(SELECT id FROM runs WHERE lane = ? ORDER BY started_at DESC LIMIT ?)",
                         (lane, lane, MAX_ROWS_PER_LANE))
-                db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (meta_key, meta_value))
                 db.commit()
             except Exception:
                 db.rollback()

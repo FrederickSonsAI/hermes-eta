@@ -93,7 +93,14 @@ def register(ctx):
             value = ctx.get_config("read_history", default=True)
         except Exception:
             return True
-        return value if isinstance(value, bool) else True
+        if isinstance(value, bool):
+            return value
+        # A hand-edited config.yaml can hold "false" (quoted) or 0: those still mean off.
+        if isinstance(value, str) and value.strip().lower() in ("false", "no", "off", "0"):
+            return False
+        if isinstance(value, (int, float)) and value == 0:
+            return False
+        return True
 
     def history_reader(before):
         # Read-only, bounded (row cap and time budget), never writes to Hermes's files.

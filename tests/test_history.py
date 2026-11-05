@@ -225,3 +225,33 @@ def test_config_off_skips_the_read(pkg, fake_ctx, monkeypatch, tmp_path):
     fake_ctx.config = {"read_history": False}
     pkg.register(fake_ctx)
     assert "No runs recorded yet" in fake_ctx.commands["eta"]("")
+
+
+def test_config_off_as_text_or_zero_still_skips_the_read(pkg, fake_ctx, monkeypatch):
+    import sqlite3 as sq
+    from eta_plugin import store as store_mod
+    monkeypatch.setattr(pkg, "_hermes_state_db", lambda: pytest.fail("read_history is off"))
+    for off in ("false", " No ", "off", "0", 0):
+        monkeypatch.setattr(store_mod, "_default_connect", lambda: sq.connect(":memory:", check_same_thread=False))
+        fake_ctx.config = {"read_history": off}
+        pkg.register(fake_ctx)
+        assert "No runs recorded yet" in fake_ctx.commands["eta"]("")
+
+
+def test_two_processes_import_only_once(pkg, tmp_path, state_db):
+    """Two Hermes processes of one profile (gateway and CLI) share the plugin's file: whichever
+    reaches first use second must not add the same past runs again."""
+    import sqlite3 as sq
+    from eta_plugin.history import read_delegated_runs
+    from eta_plugin.store import RunStore
+    from eta_plugin.tools import HISTORY_KEY
+    path = tmp_path / "plugin.db"
+    a = RunStore(lambda: sq.connect(path, check_same_thread=False))
+    b = RunStore(lambda: sq.connect(path, check_same_thread=False))
+    reader = lambda before: read_delegated_runs(state_db, before=before)  # noqa: E731
+    ha, hb = _handlers(a, reader), _handlers(b, reader)
+    assert b.get_meta(HISTORY_KEY) is None                 # b checked before a imported
+    ha.eta_history({})
+    assert hb.store.import_history([("subagent:leaf", NOW - 100, 50.0, True)], HISTORY_KEY, "{}") == 0
+    total = sq.connect(path).execute("SELECT COUNT(*) FROM runs WHERE source = 'history'").fetchone()[0]
+    assert total == 6
