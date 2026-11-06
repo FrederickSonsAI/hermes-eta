@@ -58,16 +58,23 @@ data) never fails the estimate: the answer falls back to Hermes's zone, then UTC
 
 `eta_estimate(kanban_assignee="writer")` (or `/eta @writer`) calls Hermes's own kanban tools
 through `ctx.dispatch_tool`, so it works across profiles: one `kanban_list` call for the whole
-board (up to 200 tasks), plus `kanban_show` for at most 6 tasks (running ones first, then the
-most recently finished), because only `kanban_show` returns each attempt's outcome. Open tasks
-(triage, todo, scheduled, ready, running, review) are the remaining work. Only the assignee's own
+board (up to 200 tasks), plus `kanban_show` for at most 6 tasks, because only `kanban_show`
+returns each attempt's outcome: running ones first, then, taking turns, the most recently
+finished and the most recently first-claimed of the tasks that were attempted but are not running
+or done (sent back to ready after a failed attempt, blocked after a give-up, in review). Hermes
+marks a task's first claim in `kanban_list` and never clears it, so no extra call is needed to
+find them, and a lane that keeps crashing shows its failures instead of a confident range. Open
+tasks (triage, todo, scheduled, ready, running, review) are the remaining work. Only the assignee's own
 attempts count (a task's run list also holds a reviewer's runs). Attempts that ended `completed`
 or `review_requested` count as successes, except a hand-off to review that the review then sent
 back (`changes_requested`), which counts as a failed attempt; for the reviewer, that review run
 itself is a finished run. `crashed`, `timed_out`, `spawn_failed`, `gave_up`, `stale` and
 `reclaimed` (worker died, claim expired) count as failed attempts; a reclaim an operator caused
 (manual reclaim, ancestor reopened, task archived) counts as neither, as in Hermes's own failure
-count. Blocked tasks usually wait on a person, so they are reported, not counted as failures.
+count. Blocked tasks usually wait on a person, so being blocked is not a failure (their failed
+attempts still count) and they are reported, not counted as remaining work. When blocked tasks are
+all that is left, they are the remaining work and the answer is `blocked_on_person`: "Clock starts
+when someone unblocks N blocked task(s)."
 
 Parallel lanes default to how many of the assignee's tasks are running or ready now, within
 Hermes's dispatch caps (`kanban.max_in_progress` or its memory-derived default, and
@@ -86,8 +93,9 @@ estimate says the kanban tools are not available and calls nothing.
 `eta_estimate(cron_job="<job id>")` (or `/eta cron <job id>`) reads that job's last 50 runs from
 Hermes's cron run ledger: completed runs count as successes, failed and unknown as failures,
 cancelled and missed are skipped. A run in progress is credited with its elapsed time and
-flagged when it has shown no progress for over an hour. If the job is not running, the answer is
-how long one run takes once it starts, not when the schedule fires it.
+flagged when it has shown no progress for over an hour. If the job is not running, a range is how
+long one run takes once it starts, not when the schedule fires it, and the answer says so. A "No
+honest ETA" answer only notes that the job is not running now.
 
 ## How the estimate works
 
@@ -106,7 +114,8 @@ how long one run takes once it starts, not when the schedule fires it.
 - A daily run cap pushes the remainder past the next reset hour; all math is in UTC, so
   daylight-saving changes never shift the answer.
 - Three failures in a row, under 15% success, a cap of 0, or more than a year of capped work
-  returns `unbounded`: no honest ETA.
+  returns `unbounded`: no honest ETA. When the work also waits on a person, that answer and a
+  `no_data` one still start with "Clock starts when ...".
 - Under 5 runs: the answer says "Based on N runs, so the worst case is wide", the success rate
   is pulled toward 80% (so one lucky or unlucky run cannot decide it), and the worst case uses
   at least twice the typical run and a success rate 30 points lower. These are deliberate

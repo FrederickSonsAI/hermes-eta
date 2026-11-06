@@ -95,9 +95,29 @@ def test_kanban_unavailable_is_clean_error(store):
 def test_only_blocked_work_waits_on_person(store):
     fk = FakeKanban(NOW)
     fk.tasks = [t for t in fk.tasks if t["status"] in {"done", "blocked"}]
+    h = _handlers(store, fk)
+    out = json.loads(h.eta_estimate({"kanban_assignee": "writer"}))
+    assert out["status"] == "blocked_on_person", out  # not "Nothing left to run."
+    assert out["clock_starts_when"] == "someone unblocks 1 blocked task(s)"
+    assert out["answer"].startswith("Clock starts when someone unblocks 1 blocked task(s). After that:")
+    assert out["key_numbers"]["remaining_items"] == 1  # the blocked task is the work left
+    assert not any("not counted" in n for n in out["notes"])
+    assert h.slash_eta("@writer").startswith("Clock starts when someone unblocks 1 blocked task(s).")
+    # an explicit "nothing left" from the caller still stands
+    assert json.loads(h.eta_estimate({"kanban_assignee": "writer", "remaining_items": 0}))["status"] == "done"
+
+
+def test_only_blocked_work_after_a_give_up_still_names_the_clock(store):
+    fk = FakeKanban(NOW)
+    fk.tasks = [{"id": "g1", "status": "blocked", "started_at": NOW - 4000}]
+    fk.runs = {"g1": [
+        {"started_at": NOW - 4000, "ended_at": NOW - 3900, "outcome": "crashed"},
+        {"started_at": NOW - 3800, "ended_at": NOW - 3700, "outcome": "crashed"},
+        {"started_at": NOW - 3600, "ended_at": NOW - 3500, "outcome": "timed_out"}]}
     out = json.loads(_handlers(store, fk).eta_estimate({"kanban_assignee": "writer"}))
-    assert out["status"] == "done"
-    assert any("blocked" in n for n in out["notes"])
+    assert out["status"] == "unbounded", out
+    assert out["answer"].startswith("Clock starts when someone unblocks 1 blocked task(s). No honest ETA:")
+    assert out["clock_starts_when"] == "someone unblocks 1 blocked task(s)"
 
 
 def test_db_failure_never_raises(pkg, fake_ctx, monkeypatch):
@@ -186,6 +206,54 @@ def test_reclaimed_stale_and_rejected_handoffs_are_failed_attempts(store):
     # failed: reclaim with an error, the hand-off review sent back, stale, o3's reclaim = 4 of 6
     assert out["key_numbers"]["success_rate"] == round(2 / 6, 3)
     assert out["based_on_runs"] == 6
+
+
+def test_failed_attempts_on_requeued_and_given_up_tasks_count(store):
+    """A lane that keeps crashing: its failed attempts sit on tasks that went back to ready or
+    were blocked after a give-up, not on running or done tasks."""
+    fk = FakeKanban(NOW)
+    fk.tasks = [
+        {"id": "d1", "status": "done", "started_at": NOW - 30000, "completed_at": NOW - 29400},
+        {"id": "d2", "status": "done", "started_at": NOW - 29000, "completed_at": NOW - 28400},
+        {"id": "r1", "status": "ready", "started_at": NOW - 9000},
+        {"id": "r2", "status": "ready", "started_at": NOW - 8000},
+        {"id": "g1", "status": "blocked", "started_at": NOW - 4000},
+        {"id": "n1", "status": "ready"},  # never attempted: nothing to show
+    ]
+    fk.runs = {
+        "d1": [{"started_at": NOW - 30000, "ended_at": NOW - 29400, "outcome": "completed"}],
+        "d2": [{"started_at": NOW - 29000, "ended_at": NOW - 28400, "outcome": "completed"}],
+        "r1": [{"started_at": NOW - 9000, "ended_at": NOW - 8900, "outcome": "crashed"},
+               {"started_at": NOW - 8800, "ended_at": NOW - 8700, "outcome": "reclaimed",
+                "error": "manual_reclaim: operator"},  # neutral
+               {"started_at": NOW - 8600, "ended_at": NOW - 8500, "outcome": "crashed",
+                "profile": "someone-else"},  # not this assignee's attempt
+               {"started_at": NOW - 6000, "ended_at": NOW - 5000, "outcome": "timed_out"}],
+        "r2": [{"started_at": NOW - 8000, "ended_at": NOW - 7400, "outcome": "review_requested",
+                "profile": "writer"},
+               {"started_at": NOW - 7300, "ended_at": NOW - 7200, "outcome": "changes_requested",
+                "profile": "reviewer"}],  # sent back: the hand-off failed
+        "g1": [{"started_at": NOW - 4000, "ended_at": NOW - 3900, "outcome": "stale"},
+               {"started_at": NOW - 3000, "ended_at": NOW - 2990, "outcome": "gave_up"}],
+    }
+    out = json.loads(_handlers(store, fk).eta_estimate({"kanban_assignee": "writer"}))
+    assert out["status"] == "unbounded", out  # not a confident range
+    assert out["based_on_runs"] == 7 and out["key_numbers"]["success_rate"] == round(2 / 7, 3)
+    names = [c[0] for c in fk.calls]
+    assert names.count("kanban_list") == 1 and names.count("kanban_show") == 5
+    assert "n1" not in {a.get("task_id") for _, a in fk.calls}
+
+
+def test_show_budget_keeps_both_requeued_and_finished_tasks(store):
+    fk = FakeKanban(NOW)
+    fk.tasks = [{"id": f"r{i}", "status": "ready", "started_at": NOW - 9000 + i} for i in range(10)]
+    fk.tasks += [{"id": f"d{i}", "status": "done", "started_at": NOW - 20000 + i,
+                  "completed_at": NOW - 19000 + i} for i in range(10)]
+    fk.runs = {}
+    json.loads(_handlers(store, fk).eta_estimate({"kanban_assignee": "writer"}))
+    shown = [a["task_id"] for n, a in fk.calls if n == "kanban_show"]
+    assert len(shown) == 6 and sum(t.startswith("r") for t in shown) == 3
+    assert shown[:2] == ["r9", "d9"]  # newest of each, in turn
 
 
 def test_operator_reclaims_are_not_failures(store):
@@ -458,6 +526,23 @@ def test_cron_history_and_running_run(store):
     assert out["based_on_runs"] == 3 and out["key_numbers"]["success_rate"] == round(2 / 3, 3)
     assert out["lane"] == "cron:nightly"
     assert h.slash_eta("cron nightly").startswith("Likely")
+
+
+def test_cron_no_honest_eta_drops_the_one_run_line(store):
+    rows = [{"status": "failed", "started_at": _iso(NOW - d * 86400), "finished_at": _iso(NOW - d * 86400 + 120)}
+            for d in (1, 2, 3)]
+    h = _handlers(store, cron_reader=lambda job: rows)
+    out = json.loads(h.eta_estimate({"cron_job": "nightly"}))
+    assert out["status"] == "unbounded", out
+    text = h.slash_eta("cron nightly")
+    assert text.startswith("No honest ETA: the last 3 runs failed in a row.")
+    for said in [text, *out["notes"]]:
+        assert "how long one run takes" not in said, said
+    assert "Cron job nightly is not running now." in out["notes"]
+    good = [{"status": "completed", "started_at": _iso(NOW - d * 86400),
+             "finished_at": _iso(NOW - d * 86400 + 600)} for d in (1, 2, 3)]
+    ok = json.loads(_handlers(store, cron_reader=lambda job: good).eta_estimate({"cron_job": "nightly"}))
+    assert ok["status"] == "ok" and any("how long one run takes" in n for n in ok["notes"])
 
 
 def test_cron_quiet_run_and_missing_ledger(store):

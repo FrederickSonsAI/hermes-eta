@@ -252,19 +252,25 @@ def estimate(*, remaining_items: int, stats: Optional[LaneStats] = None,
     if runs_left_today is not None:
         numbers["runs_left_today"] = runs_left_today
 
+    clock = waiting_on_person or None
+
+    def no_range(status: str, headline: str, **kw) -> Estimate:
+        # No range to give, but a step that waits on a person still says when the clock starts.
+        if clock:
+            headline = f"Clock starts when {clock}. {headline}"
+        return Estimate(status=status, headline=headline, key_numbers=numbers,
+                        clock_starts_when=clock, **kw)
+
     if daily_run_cap == 0:
-        return Estimate(
-            status="unbounded",
-            headline="No honest ETA: the daily run cap is 0, so nothing can run.",
-            key_numbers=numbers, biggest_risk="The run cap.")
+        return no_range("unbounded", "No honest ETA: the daily run cap is 0, so nothing can run.",
+                        biggest_risk="The run cap.")
 
     if streak >= STUCK_STREAK or (sr is not None and sr < MIN_SUCCESS_RATE):
         why = (f"the last {streak} runs failed in a row" if streak >= STUCK_STREAK
                else f"only {round((sr or 0) * 100)}% of recent runs succeed")
-        return Estimate(
-            status="unbounded",
-            headline=f"No honest ETA: {why}. Fix the failing step first, then re-estimate.",
-            key_numbers=numbers, biggest_risk="The same failure repeating.")
+        return no_range("unbounded",
+                        f"No honest ETA: {why}. Fix the failing step first, then re-estimate.",
+                        biggest_risk="The same failure repeating.")
 
     rough = rough_basis if (rough_basis and avg_run_s is None) else None
     if med is None and running and max(running) >= MIN_ELAPSED_FOR_GUESS_S:
@@ -275,13 +281,11 @@ def estimate(*, remaining_items: int, stats: Optional[LaneStats] = None,
         med, p90, longest = 2 * e, 4 * e, None
         rough = f"how long the current run has been going ({duration_words(timedelta(seconds=e))})"
     if med is None:
-        return Estimate(
-            status="no_data",
-            headline=("No honest ETA yet: there is no finished run to go on. Give a typical run "
-                      "length (avg_run_minutes) or how long the current run has been going "
-                      "(running_minutes), or let one run finish. Delegated subagent runs are "
-                      "recorded automatically."),
-            key_numbers=numbers)
+        return no_range("no_data",
+                        "No honest ETA yet: there is no finished run to go on. Give a typical run "
+                        "length (avg_run_minutes) or how long the current run has been going "
+                        "(running_minutes), or let one run finish. Delegated subagent runs are "
+                        "recorded automatically.")
 
     wide = rough is not None or (avg_run_s is None and samples < LOW_SAMPLES)
     sr_eff = sr if sr is not None else 1.0
@@ -295,7 +299,6 @@ def estimate(*, remaining_items: int, stats: Optional[LaneStats] = None,
     if runs_likely != runs_needed:
         numbers["runs_expected"] = round(runs_likely, 2)
 
-    clock = waiting_on_person or None
     slow = max(p90 or med * 1.5, med)
     if wide:  # the slowest of a handful of runs says little about the slow tail
         slow = max(slow, longest or 0.0, med * 2)
@@ -304,9 +307,8 @@ def estimate(*, remaining_items: int, stats: Optional[LaneStats] = None,
         likely, worst = _range(now_utc, now, tz, queue_ahead, runs_likely, runs_worst, med, slow,
                                lanes, runs_left_today, daily_run_cap, reset_hour, review_s, running)
     except OverflowError:
-        return Estimate(status="unbounded",
-                        headline="No honest ETA: at this run cap the work takes more than a year.",
-                        key_numbers=numbers, biggest_risk="The daily run cap.")
+        return no_range("unbounded", "No honest ETA: at this run cap the work takes more than a year.",
+                        biggest_risk="The daily run cap.")
 
     risk = None
     overdue = sum(1 for e in running if e > slow)

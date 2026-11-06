@@ -33,8 +33,11 @@ def _operator_reclaim(run: dict) -> bool:
     error = run.get("error")
     return not error or str(error).startswith("manual_reclaim")
 # One kanban_list call reads the whole board for the assignee; kanban_show (the only tool that
-# returns per-run outcomes) is called for at most this many tasks: running ones first, then the
-# most recently finished.
+# returns per-run outcomes) is called for at most this many tasks: running ones first, then, in
+# turn, the most recently finished and the most recently first-claimed of the tasks that were
+# attempted but are neither running nor done (sent back to ready after a failed attempt, blocked
+# after a give-up, in review). Hermes sets a task's started_at at its first claim and never
+# clears it, so kanban_list already shows which tasks have attempts worth reading.
 _KANBAN_SHOW_MAX = 6
 _KANBAN_LIST_LIMIT = 200  # kanban_list's own maximum
 # A running cron run with no progress for this long has gone quiet. Same bound Hermes uses for a
@@ -245,6 +248,9 @@ class Handlers:
         running = by_status.get("running", [])
         done = sorted(by_status.get("done", []), key=lambda t: _ts(t.get("completed_at")) or 0,
                       reverse=True)
+        attempted = sorted((t for t in tasks if t.get("status") not in ("running", "done")
+                            and _ts(t.get("started_at"))),
+                           key=lambda t: _ts(t.get("started_at")), reverse=True)
 
         runs: list[Run] = []
         elapsed: list[float] = []
@@ -291,11 +297,17 @@ class Handlers:
             start = (max(a for a in active if a) if any(active) else None) or _ts(task.get("started_at"))
             if start and start <= now_s:
                 elapsed.append(now_s - start)
-        for task in done[:max(budget, 0)]:
+        # Finished and attempted-but-open tasks take turns, so neither the successes nor the
+        # failed attempts crowd the other out of the budget.
+        picks: list[tuple[dict, bool]] = []
+        for i in range(max(len(done), len(attempted))):
+            picks += [(t[i], is_done) for t, is_done in ((attempted, False), (done, True))
+                      if i < len(t)]
+        for task, is_done in picks[:max(budget, 0)]:
             task_runs = show(task)
             if task_runs:
                 closed(task_runs)
-            else:  # fall back to the task's own timestamps: one successful run
+            elif is_done:  # fall back to the task's own timestamps: one successful run
                 start, end = _ts(task.get("started_at")), _ts(task.get("completed_at"))
                 if start and end and end >= start:
                     runs.append(Run(started_at=start, duration_s=end - start, ok=True))
@@ -356,6 +368,7 @@ class Handlers:
             runs: list[Run] = []
             elapsed: list[float] = []
             quiet = 0
+            cron_idle = None
             if lane:
                 runs = (self.store.runs_like(SUBAGENT_LANE + ":") if lane.lower() == SUBAGENT_LANE
                         else self.store.runs(lane))
@@ -365,7 +378,8 @@ class Handlers:
                 sources.append("kanban")
                 runs = runs + kb["runs"]
                 elapsed += kb["elapsed"]
-                if remaining is None:
+                from_board = remaining is None
+                if from_board:
                     remaining = kb["open"]
                 if lanes is None and (kb["running"] or kb["ready"]):
                     # Ready tasks are dispatched in parallel, up to Hermes's concurrency caps.
@@ -375,10 +389,13 @@ class Handlers:
                     if not kb["running"]:
                         notes.append(f"Nothing is running for {assignee} right now; this assumes "
                                      "the kanban dispatcher picks up the ready tasks.")
-                if kb["blocked"]:
+                if kb["blocked"] and from_board and remaining == 0:
+                    # Only blocked work is left: it is the remaining work, and its clock starts
+                    # when someone unblocks it.
+                    remaining = kb["blocked"]
+                    waiting = waiting or f"someone unblocks {kb['blocked']} blocked task(s)"
+                elif kb["blocked"]:
                     notes.append(f"{kb['blocked']} task(s) are blocked and not counted.")
-                    if not waiting and remaining == 0:
-                        waiting = f"someone unblocks {kb['blocked']} blocked task(s)"
                 if kb["truncated"]:
                     notes.append(f"Board has more than {_KANBAN_LIST_LIMIT} tasks for this "
                                  "assignee; counts are partial.")
@@ -397,8 +414,7 @@ class Handlers:
                 if remaining is None:
                     remaining = max(len(cr["elapsed"]) if cr else 0, 1)
                     if not (cr and cr["elapsed"]):
-                        notes.append(f"Cron job {cron_job} is not running now: this is how long "
-                                     "one run takes once it starts, not when its schedule fires.")
+                        cron_idle = (len(notes), cron_job)  # worded once the answer is known
             if running_min is not None:
                 elapsed.append(running_min * 60)
                 if remaining is None:
@@ -426,6 +442,12 @@ class Handlers:
                 running_elapsed_s=elapsed, quiet_running=quiet, rough_basis=rough_basis,
                 now=now_dt, tz=tz)
             answer = est.headline
+            if cron_idle:
+                at, job = cron_idle
+                # Only a range is "how long one run takes"; without one, say the plain fact.
+                notes.insert(at, f"Cron job {job} is not running now: this is how long one run "
+                                 "takes once it starts, not when its schedule fires."
+                             if est.likely_at else f"Cron job {job} is not running now.")
             if tz_note:
                 notes.append(tz_note)
                 answer += f" ({tz_note})"

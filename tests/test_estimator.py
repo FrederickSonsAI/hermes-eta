@@ -111,6 +111,13 @@ def test_no_data(pkg):
     assert e.estimate(remaining_items=3, now=NOW).status == "no_data"
 
 
+def test_clock_is_kept_when_there_is_no_range(pkg):
+    from eta_plugin import estimator as e
+    r = e.estimate(remaining_items=1, now=NOW, waiting_on_person="someone unblocks 1 blocked task(s)")
+    assert r.status == "no_data" and r.clock_starts_when == "someone unblocks 1 blocked task(s)"
+    assert r.headline.startswith("Clock starts when someone unblocks 1 blocked task(s). No honest ETA yet")
+
+
 def test_done(pkg):
     from eta_plugin import estimator as e
     assert e.estimate(remaining_items=0, now=NOW).status == "done"
