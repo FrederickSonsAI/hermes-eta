@@ -120,6 +120,30 @@ def test_only_blocked_work_after_a_give_up_still_names_the_clock(store):
     assert out["clock_starts_when"] == "someone unblocks 1 blocked task(s)"
 
 
+def test_only_blocked_work_runs_in_parallel_once_unblocked(store):
+    """Unblocked tasks are ready, so the range after the clock starts uses the same lanes as the
+    same tasks waiting in ready would: not one at a time."""
+    done = [{"id": f"d{i}", "status": "done", "started_at": NOW - 9000 + i * 1000,
+             "completed_at": NOW - 9000 + i * 1000 + 600} for i in range(6)]
+
+    def board(status):
+        fk = FakeKanban(NOW)
+        fk.tasks = done + [{"id": f"x{i}", "status": status} for i in range(4)]
+        fk.runs = {t["id"]: [{"started_at": t["started_at"], "ended_at": t["completed_at"],
+                              "outcome": "completed"}] for t in done}
+        return fk
+
+    blocked = json.loads(_handlers(store, board("blocked"), dispatch_cap=lambda: 3).eta_estimate(
+        {"kanban_assignee": "writer"}))
+    ready = json.loads(_handlers(store, board("ready"), dispatch_cap=lambda: 3).eta_estimate(
+        {"kanban_assignee": "writer"}))
+    assert blocked["status"] == "blocked_on_person", blocked
+    assert blocked["key_numbers"]["lanes"] == ready["key_numbers"]["lanes"] == 3
+    assert blocked["answer"].startswith(
+        "Clock starts when someone unblocks 4 blocked task(s). After that: 20 min to"), blocked
+    assert not any("Nothing is running" in n for n in blocked["notes"])
+
+
 def test_db_failure_never_raises(pkg, fake_ctx, monkeypatch):
     from eta_plugin import store as store_mod
 
@@ -552,3 +576,4 @@ def test_cron_quiet_run_and_missing_ledger(store):
     assert any("no progress" in n for n in out["notes"])
     none = json.loads(_handlers(store, cron_reader=lambda job: None).eta_estimate({"cron_job": "j"}))
     assert any("No cron run history" in n for n in none["notes"]) and none["status"] == "no_data"
+    assert not any("not running now" in n for n in none["notes"])  # no ledger: not known

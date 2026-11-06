@@ -76,8 +76,9 @@ attempts still count) and they are reported, not counted as remaining work. When
 all that is left, they are the remaining work and the answer is `blocked_on_person`: "Clock starts
 when someone unblocks N blocked task(s)."
 
-Parallel lanes default to how many of the assignee's tasks are running or ready now, within
-Hermes's dispatch caps (`kanban.max_in_progress` or its memory-derived default, and
+Parallel lanes default to how many of the assignee's tasks are running or ready now (when only
+blocked tasks are left, how many will be ready once unblocked), within Hermes's dispatch caps
+(`kanban.max_in_progress` or its memory-derived default, and
 `kanban.max_in_progress_per_profile`). A running task is credited with the time its current
 attempt has already run.
 

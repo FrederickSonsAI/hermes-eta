@@ -381,17 +381,19 @@ class Handlers:
                 from_board = remaining is None
                 if from_board:
                     remaining = kb["open"]
-                if lanes is None and (kb["running"] or kb["ready"]):
+                # Only blocked work is left: it is the remaining work, and its clock starts when
+                # someone unblocks it. The range after that is for those tasks once they are ready.
+                only_blocked = bool(kb["blocked"]) and from_board and remaining == 0
+                ready = kb["ready"] + (kb["blocked"] if only_blocked else 0)
+                if lanes is None and (kb["running"] or ready):
                     # Ready tasks are dispatched in parallel, up to Hermes's concurrency caps.
-                    want = kb["running"] + kb["ready"]
+                    want = kb["running"] + ready
                     limit = self.dispatch_cap()
                     lanes = max(1, min(want, max(limit, kb["running"])) if limit else want)
-                    if not kb["running"]:
+                    if not kb["running"] and not only_blocked:
                         notes.append(f"Nothing is running for {assignee} right now; this assumes "
                                      "the kanban dispatcher picks up the ready tasks.")
-                if kb["blocked"] and from_board and remaining == 0:
-                    # Only blocked work is left: it is the remaining work, and its clock starts
-                    # when someone unblocks it.
+                if only_blocked:
                     remaining = kb["blocked"]
                     waiting = waiting or f"someone unblocks {kb['blocked']} blocked task(s)"
                 elif kb["blocked"]:
@@ -413,7 +415,7 @@ class Handlers:
                                      f"progress for over {_QUIET_S // 60} min.")
                 if remaining is None:
                     remaining = max(len(cr["elapsed"]) if cr else 0, 1)
-                    if not (cr and cr["elapsed"]):
+                    if cr is not None and not cr["elapsed"]:  # no ledger: running is unknown
                         cron_idle = (len(notes), cron_job)  # worded once the answer is known
             if running_min is not None:
                 elapsed.append(running_min * 60)
