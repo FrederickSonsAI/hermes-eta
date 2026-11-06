@@ -260,6 +260,12 @@ class Handlers:
                     gated.add(t.get("id"))
                     waits_on.add(t.get("id"))
                     grew = True
+        # unblock_task re-gates on parents too: a blocked task whose parent on this board is
+        # blocked or waits on one lands in todo once unblocked, not ready, so it is no extra lane.
+        unblock_ready = sum(
+            1 for t in by_status.get("blocked", [])
+            if not (isinstance(t.get("parents"), list) and waits_on.intersection(
+                p for p in t["parents"] if isinstance(p, str))))
         running = by_status.get("running", [])
         done = sorted(by_status.get("done", []), key=lambda t: _ts(t.get("completed_at")) or 0,
                       reverse=True)
@@ -327,7 +333,7 @@ class Handlers:
                 if start and end and end >= start:
                     runs.append(Run(started_at=start, duration_s=end - start, ok=True))
         return {"open": len(open_tasks) - len(gated), "gated": len(gated),
-                "blocked": len(by_status.get("blocked", [])),
+                "blocked": len(by_status.get("blocked", [])), "unblock_ready": unblock_ready,
                 "running": len(running), "ready": len(by_status.get("ready", [])),
                 "elapsed": elapsed, "runs": runs, "truncated": bool(data.get("truncated"))}
 
@@ -401,7 +407,7 @@ class Handlers:
                 # it is the remaining work, and its clock starts when someone unblocks it. The
                 # range after that is for that work once the blocked tasks are ready.
                 only_blocked = bool(kb["blocked"]) and from_board and remaining == 0
-                ready = kb["ready"] + (kb["blocked"] if only_blocked else 0)
+                ready = kb["ready"] + (kb["unblock_ready"] if only_blocked else 0)
                 if lanes is None and (kb["running"] or ready):
                     # Ready tasks are dispatched in parallel, up to Hermes's concurrency caps.
                     want = kb["running"] + ready

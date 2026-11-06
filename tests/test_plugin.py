@@ -619,3 +619,22 @@ def test_runnable_work_beside_blocked_children_is_still_estimated(store):
     assert "1 todo task(s) wait on a blocked task and are not counted." in out["notes"]
     names = [c[0] for c in fk.calls]
     assert names.count("kanban_list") == 1 and names.count("kanban_show") <= 6
+
+
+def test_blocked_chain_unblocks_one_at_a_time(store):
+    """Hermes's unblock_task re-gates on parents: a blocked task whose parent on the board is
+    blocked lands in todo, not ready, so it is no extra lane once the clock starts."""
+    def board(chained):
+        fk = _history_board()
+        fk.tasks += [{"id": f"b{i}", "status": "blocked",
+                      "parents": [f"b{i - 1}"] if chained and i else []} for i in range(4)]
+        return fk
+
+    chain = json.loads(_handlers(store, board(True), dispatch_cap=lambda: 3).eta_estimate(
+        {"kanban_assignee": "writer"}))
+    loose = json.loads(_handlers(store, board(False), dispatch_cap=lambda: 3).eta_estimate(
+        {"kanban_assignee": "writer"}))
+    assert chain["status"] == loose["status"] == "blocked_on_person", chain
+    assert chain["answer"].startswith("Clock starts when someone unblocks 4 blocked task(s).")
+    assert loose["key_numbers"]["lanes"] == 3
+    assert chain["key_numbers"]["lanes"] == 1, chain
