@@ -245,6 +245,21 @@ class Handlers:
         for t in tasks:
             by_status.setdefault(t.get("status"), []).append(t)
         open_tasks = [t for t in tasks if t.get("status") in _OPEN]
+        # A todo task stays todo while any parent is unfinished (Hermes's recompute_ready, which
+        # kanban_list runs first). One whose parent on this board is blocked, directly or through
+        # another such todo task, waits on whoever unblocks it, just like the blocked task.
+        waits_on = {t.get("id") for t in by_status.get("blocked", []) if t.get("id")}
+        gated: set = set()
+        grew = True
+        while grew:
+            grew = False
+            for t in by_status.get("todo", []):
+                parents = t.get("parents")
+                if (t.get("id") and t.get("id") not in gated and isinstance(parents, list)
+                        and waits_on.intersection(p for p in parents if isinstance(p, str))):
+                    gated.add(t.get("id"))
+                    waits_on.add(t.get("id"))
+                    grew = True
         running = by_status.get("running", [])
         done = sorted(by_status.get("done", []), key=lambda t: _ts(t.get("completed_at")) or 0,
                       reverse=True)
@@ -311,7 +326,8 @@ class Handlers:
                 start, end = _ts(task.get("started_at")), _ts(task.get("completed_at"))
                 if start and end and end >= start:
                     runs.append(Run(started_at=start, duration_s=end - start, ok=True))
-        return {"open": len(open_tasks), "blocked": len(by_status.get("blocked", [])),
+        return {"open": len(open_tasks) - len(gated), "gated": len(gated),
+                "blocked": len(by_status.get("blocked", [])),
                 "running": len(running), "ready": len(by_status.get("ready", [])),
                 "elapsed": elapsed, "runs": runs, "truncated": bool(data.get("truncated"))}
 
@@ -381,8 +397,9 @@ class Handlers:
                 from_board = remaining is None
                 if from_board:
                     remaining = kb["open"]
-                # Only blocked work is left: it is the remaining work, and its clock starts when
-                # someone unblocks it. The range after that is for those tasks once they are ready.
+                # Only blocked work is left (blocked tasks and the todo tasks that wait on them):
+                # it is the remaining work, and its clock starts when someone unblocks it. The
+                # range after that is for that work once the blocked tasks are ready.
                 only_blocked = bool(kb["blocked"]) and from_board and remaining == 0
                 ready = kb["ready"] + (kb["blocked"] if only_blocked else 0)
                 if lanes is None and (kb["running"] or ready):
@@ -394,10 +411,13 @@ class Handlers:
                         notes.append(f"Nothing is running for {assignee} right now; this assumes "
                                      "the kanban dispatcher picks up the ready tasks.")
                 if only_blocked:
-                    remaining = kb["blocked"]
+                    remaining = kb["blocked"] + kb["gated"]
                     waiting = waiting or f"someone unblocks {kb['blocked']} blocked task(s)"
                 elif kb["blocked"]:
                     notes.append(f"{kb['blocked']} task(s) are blocked and not counted.")
+                    if kb["gated"] and from_board:
+                        notes.append(f"{kb['gated']} todo task(s) wait on a blocked task and are "
+                                     "not counted.")
                 if kb["truncated"]:
                     notes.append(f"Board has more than {_KANBAN_LIST_LIMIT} tasks for this "
                                  "assignee; counts are partial.")

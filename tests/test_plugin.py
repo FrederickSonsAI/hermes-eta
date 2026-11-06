@@ -577,3 +577,45 @@ def test_cron_quiet_run_and_missing_ledger(store):
     none = json.loads(_handlers(store, cron_reader=lambda job: None).eta_estimate({"cron_job": "j"}))
     assert any("No cron run history" in n for n in none["notes"]) and none["status"] == "no_data"
     assert not any("not running now" in n for n in none["notes"])  # no ledger: not known
+
+
+def _history_board():
+    fk = FakeKanban(NOW)
+    done = [{"id": f"d{i}", "status": "done", "started_at": NOW - 9000 + i * 1000,
+             "completed_at": NOW - 9000 + i * 1000 + 600} for i in range(6)]
+    fk.tasks = list(done)
+    fk.runs = {t["id"]: [{"started_at": t["started_at"], "ended_at": t["completed_at"],
+                          "outcome": "completed"}] for t in done}
+    return fk
+
+
+def test_todo_children_of_a_blocked_task_wait_on_the_same_person(store):
+    """kanban_list's parents field: a todo task whose parent (or grandparent) on the board is
+    blocked cannot start until that task is unblocked, so it gets no range of its own."""
+    fk = _history_board()
+    fk.tasks += [{"id": "b0", "status": "blocked", "parents": [], "children": ["t1"]},
+                 {"id": "t1", "status": "todo", "parents": ["b0"], "children": ["t2"]},
+                 {"id": "t2", "status": "todo", "parents": ["t1"], "children": []}]
+    h = _handlers(store, fk)
+    out = json.loads(h.eta_estimate({"kanban_assignee": "writer"}))
+    assert out["status"] == "blocked_on_person", out
+    assert out["answer"].startswith("Clock starts when someone unblocks 1 blocked task(s). After that:")
+    assert out["key_numbers"]["remaining_items"] == 3  # the blocked task and both children
+    assert h.slash_eta("@writer").startswith("Clock starts when someone unblocks 1 blocked task(s).")
+    names = [c[0] for c in fk.calls]
+    assert names.count("kanban_list") == 2 and names.count("kanban_show") <= 12  # two calls above
+
+
+def test_runnable_work_beside_blocked_children_is_still_estimated(store):
+    fk = _history_board()
+    fk.tasks += [{"id": "r1", "status": "ready", "parents": []},
+                 {"id": "b0", "status": "blocked", "parents": []},
+                 {"id": "t1", "status": "todo", "parents": ["b0"]},
+                 {"id": "t2", "status": "todo", "parents": ["elsewhere"]}]  # parent not on board
+    out = json.loads(_handlers(store, fk).eta_estimate({"kanban_assignee": "writer"}))
+    assert out["status"] == "ok", out
+    assert out["key_numbers"]["remaining_items"] == 2  # r1 and t2
+    assert "1 task(s) are blocked and not counted." in out["notes"]
+    assert "1 todo task(s) wait on a blocked task and are not counted." in out["notes"]
+    names = [c[0] for c in fk.calls]
+    assert names.count("kanban_list") == 1 and names.count("kanban_show") <= 6

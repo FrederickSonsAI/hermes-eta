@@ -72,9 +72,13 @@ itself is a finished run. `crashed`, `timed_out`, `spawn_failed`, `gave_up`, `st
 `reclaimed` (worker died, claim expired) count as failed attempts; a reclaim an operator caused
 (manual reclaim, ancestor reopened, task archived) counts as neither, as in Hermes's own failure
 count. Blocked tasks usually wait on a person, so being blocked is not a failure (their failed
-attempts still count) and they are reported, not counted as remaining work. When blocked tasks are
-all that is left, they are the remaining work and the answer is `blocked_on_person`: "Clock starts
-when someone unblocks N blocked task(s)."
+attempts still count) and they are reported, not counted as remaining work. The same goes for a
+todo task whose parent on the board (from `kanban_list`'s `parents` field) is blocked, directly or
+through another such todo task: Hermes keeps it in todo until that parent is done, so it waits on
+the same person. A parent assigned to someone else is not on the assignee's board and is not seen.
+When blocked tasks and the todo tasks that wait on them are all that is left, they are the
+remaining work and the answer is `blocked_on_person`: "Clock starts when someone unblocks N
+blocked task(s)."
 
 Parallel lanes default to how many of the assignee's tasks are running or ready now (when only
 blocked tasks are left, how many will be ready once unblocked), within Hermes's dispatch caps
