@@ -204,9 +204,9 @@ class Handlers:
 
     def _zone(self, args: dict, now: datetime) -> tuple[tzinfo, str, str, Optional[str]]:
         """Time zone for the answer: the call's, else the plugin setting, else Hermes's own
-        (hermes_time.get_timezone), else this machine's local zone. A named zone that cannot be
-        loaded (a typo, or no tz database, as on Termux without tzdata) is never an error: the
-        answer falls back to Hermes's zone, then UTC, and says so."""
+        (HERMES_TIMEZONE, else config.yaml `timezone`), else this machine's local zone. A named
+        zone that cannot be loaded (a typo, or no tz database, as on Termux without tzdata) is
+        never an error: the answer falls back to Hermes's zone, then UTC, and says so."""
         for name, source in ((args.get("timezone"), "argument"), (self.default_tz(), "plugin setting")):
             if not name:
                 continue
@@ -412,7 +412,11 @@ class Handlers:
                     # Ready tasks are dispatched in parallel, up to Hermes's concurrency caps.
                     want = kb["running"] + ready
                     limit = self.dispatch_cap()
+                    # (cap, note): the cap is Hermes's derived default, not a configured number.
+                    limit, cap_note = limit if isinstance(limit, tuple) else (limit, None)
                     lanes = max(1, min(want, max(limit, kb["running"])) if limit else want)
+                    if cap_note and lanes < want:
+                        notes.append(cap_note)
                     if not kb["running"] and not only_blocked:
                         notes.append(f"Nothing is running for {assignee} right now; this assumes "
                                      "the kanban dispatcher picks up the ready tasks.")

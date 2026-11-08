@@ -83,8 +83,10 @@ blocked task(s)."
 Parallel lanes default to how many of the assignee's tasks are running or ready now (when only
 blocked tasks are left, how many will be ready once unblocked), within Hermes's dispatch caps
 (`kanban.max_in_progress` or its memory-derived default, and
-`kanban.max_in_progress_per_profile`). A running task is credited with the time its current
-attempt has already run.
+`kanban.max_in_progress_per_profile`). Hermes has no public reader for that default, so the
+plugin mirrors Hermes 0.23's formula (one worker per 512 MiB of total memory, 2 to 8; none where
+`/proc/meminfo` cannot be read); when it is the cap that limits the lanes, the answer says so and
+how to pin it. A running task is credited with the time its current attempt has already run.
 
 Side effect to know about: Hermes's `kanban_list` (like `hermes kanban list`) first promotes
 tasks whose dependencies have cleared to `ready`. The plugin itself writes nothing to the board.
@@ -161,12 +163,18 @@ honest ETA" answer only notes that the job is not running now.
   - the kanban board, through Hermes's `kanban_list` and `kanban_show` tools (task statuses,
     run times and outcomes). `kanban_list` promotes dependency-cleared tasks to `ready` as part
     of Hermes's own listing; the plugin itself never writes to the board.
-  - a cron job's run history, through Hermes's `cron.executions.list_executions` (statuses and
-    timestamps), only when the cron run ledger already exists. Opening it is Hermes's own code,
-    which may upgrade an old ledger's schema.
-  - Hermes's time zone (`hermes_time.get_timezone`) and kanban concurrency settings
-    (`kanban.max_in_progress`, `kanban.max_in_progress_per_profile`; when the first is unset,
-    Hermes's own default is derived from the machine's total memory).
+  - a cron job's run history (statuses and timestamps) from Hermes's cron run ledger
+    (`<hermes home>/cron/executions.db`), only when it already exists: the same rows and order
+    as Hermes's own `list_executions`, opened with SQLite's read-only mode (`mode=ro`,
+    `query_only`), so it is never created and an old ledger's schema is never upgraded.
+  - Hermes's time zone (`HERMES_TIMEZONE`, else `timezone` in config.yaml, as Hermes resolves
+    it) and kanban concurrency settings (`kanban.max_in_progress`,
+    `kanban.max_in_progress_per_profile`; when the first is unset, Hermes's default is derived
+    from the machine's total memory), through Hermes's public config API
+    (`hermes_cli.config.load_config_readonly`).
+  - Only Hermes's public plugin surfaces are imported (`hermes_cli.config`, `hermes_constants`,
+    `agent.secret_scope`, `tools.registry`, `plugins.plugin_storage`), so `hermes plugins
+    validate` reports no private core imports.
   - whether Hermes offers the kanban tools here (Hermes's tool registry availability check).
 - Reads, once, on first use: Hermes's session history file (`<hermes home>/state.db`), to learn
   from delegated subagent runs made before the plugin was installed. Hermes has no public plugin

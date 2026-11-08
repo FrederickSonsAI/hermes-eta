@@ -352,6 +352,18 @@ def test_lanes_follow_running_and_ready_within_dispatch_cap(store):
     assert told["key_numbers"]["lanes"] == 1
 
 
+def test_derived_dispatch_cap_is_named_only_when_it_limits_lanes(store):
+    fk = FakeKanban(NOW)
+    fk.tasks += [{"id": f"r{i}", "status": "ready"} for i in range(4)]  # 5 ready + 1 running
+    note = "At most 2 kanban task(s) run at once here"
+    capped = json.loads(_handlers(store, fk, dispatch_cap=lambda: (2, note)).eta_estimate(
+        {"kanban_assignee": "writer"}))
+    assert capped["key_numbers"]["lanes"] == 2 and note in capped["notes"]
+    roomy = json.loads(_handlers(store, fk, dispatch_cap=lambda: (8, note)).eta_estimate(
+        {"kanban_assignee": "writer"}))
+    assert roomy["key_numbers"]["lanes"] == 6 and note not in roomy["notes"]
+
+
 def test_running_task_elapsed_is_subtracted(store):
     for _ in range(6):
         store.record("ci", 1200, True, started_at=NOW - 7200)
